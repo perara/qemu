@@ -11,11 +11,28 @@
 
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
+#include "system/block-backend.h"
 
 #define TYPE_BCM2835_OTP "bcm2835-otp"
 OBJECT_DECLARE_SIMPLE_TYPE(BCM2835OTPState, BCM2835_OTP)
 
 #define BCM2835_OTP_ROW_COUNT                              66
+
+/* Public BCM2711 factory/security rows. */
+#define BCM2711_OTP_BOOTMODE_ROW                            17
+#define BCM2711_OTP_BOOTMODE_COPY_ROW                       18
+#define BCM2711_OTP_SERIAL_ROW                              28
+#define BCM2711_OTP_SERIAL_INVERTED_ROW                     29
+#define BCM2711_OTP_BOARD_REVISION_ROW                      30
+#define BCM2711_OTP_BOARD_REVISION_EXT_ROW                  33
+#define BCM2711_OTP_CUSTOMER_KEY_HASH_ROW                   47
+#define BCM2711_OTP_CUSTOMER_KEY_HASH_LEN                    8
+#define BCM2711_OTP_SECURE_BOOT_FLAGS_ROW                   55
+
+#define BCM2711_OTP_BOOTMODE_SECURE_BOOT                BIT(15)
+#define BCM2711_OTP_SECURE_BOOT_FLAGS_ENABLE             BIT(0)
+#define BCM2711_OTP_SECURE_BOOT_FLAGS_REVOKE_DEVKEY      BIT(7)
+#define BCM2711_OTP_SECURE_BOOT_FLAGS_PRODUCTION          0x81
 
 /* https://elinux.org/BCM2835_registers#OTP */
 #define BCM2835_OTP_BOOTMODE_REG                         0x00
@@ -58,6 +75,8 @@ struct BCM2835OTPState {
 
     /* <public> */
     MemoryRegion iomem;
+    BlockBackend *blk;
+    uint32_t board_rev;
     uint32_t otp_rows[BCM2835_OTP_ROW_COUNT];
 };
 
