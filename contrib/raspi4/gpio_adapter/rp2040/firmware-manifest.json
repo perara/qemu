@@ -1,0 +1,40 @@
+{
+  "$comment": "/* SPDX-License-Identifier: GPL-2.0-or-later */",
+  "version": 1,
+  "board": "pico",
+  "allowed_gpio_mask": "0x1c7fffff",
+  "pico_sdk": {
+    "version": "2.3.0",
+    "commit": "98a542c1a62fb549ffb5d66a3e5892b06276b670"
+  },
+  "toolchain": {
+    "name": "Arm GNU Toolchain",
+    "version": "15.2.Rel1",
+    "target": "arm-none-eabi",
+    "archive": "arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz",
+    "archive_sha256": "597893282ac8c6ab1a4073977f2362990184599643b4c5ee34870a8215783a16"
+  },
+  "sources": {
+    "../qgpio_core.c": "408d8ad326ca9e02acec19cffa5e78fd4e6e02e0d9e294a79337136e872ac29d",
+    "../qgpio_core.h": "85c94134b045881796f4bac558696192f8ba7a825eae9e6afbc8e6220e279aff",
+    "main.c": "00176b145ef42692972af8ea5a5082a2a62557e31454960097505550c16f4066",
+    "CMakeLists.txt": "229b1accd7c55d7e278a564ef9cd7092f53aebf3beec40e464423123f582623d"
+  },
+  "outputs": {
+    "qgpio_adapter.bin": {
+      "size": 35284,
+      "sha256": "0c3a88310358aea418b63e3cd972688f175e1374bddd8b83ebb3226348ea4298"
+    },
+    "qgpio_adapter.uf2": {
+      "size": 70656,
+      "sha256": "607cdf7ea2ab7af2121bdb0733f710bec6fef10938b758b016ead6faf3cc633a"
+    }
+  },
+  "reproducibility": {
+    "independent_clean_builds": 2,
+    "byte_identical_bin": true,
+    "byte_identical_uf2": true,
+    "program_name": "QEMU Raspberry Pi GPIO adapter",
+    "program_version": "1.0"
+  }
+}
