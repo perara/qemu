@@ -18,6 +18,7 @@ Details about QEMU's various subsystems including how to add features to them.
    migration/index
    multi-process
    reset
+   raspi4-platform
    s390-cpu-topology
    s390-dasd-ipl
    ssi
