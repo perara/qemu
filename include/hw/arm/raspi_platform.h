@@ -43,6 +43,8 @@ struct RaspiBaseMachineState {
     MachineState parent_obj;
     /*< public >*/
     struct arm_boot_info binfo;
+    MemoryRegion ram_low_alias;
+    MemoryRegion ram_high_alias;
 };
 
 struct RaspiBaseMachineClass {
@@ -57,8 +59,21 @@ const char *board_soc_type(uint32_t board_rev);
 void raspi_machine_init(MachineState *machine);
 
 typedef struct BCM283XBaseState BCM283XBaseState;
+typedef struct BlockBackend BlockBackend;
 void raspi_base_machine_init(MachineState *machine,
-                             BCM283XBaseState *soc);
+                             BCM283XBaseState *soc,
+                             BlockBackend *boot_storage,
+                             DeviceState *boot_controller,
+                             bool boot_emmc,
+                             BlockBackend *emmc_boot_storage,
+                             BlockBackend *emmc_rpmb_storage,
+                             const char *emmc_cid,
+                             uint64_t emmc_cache_size,
+                             bool emmc_cache_power_loss_on_reset,
+                             uint64_t emmc_cache_flush_sector_delay_us,
+                             uint64_t emmc_program_sector_delay_us,
+                             uint64_t emmc_erase_group_delay_us,
+                             uint32_t board_rev);
 
 void raspi_machine_class_common_init(MachineClass *mc,
                                      uint32_t board_rev);

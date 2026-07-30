@@ -41,7 +41,7 @@ static void bcm2838_gic_set_irq(void *opaque, int irq, int level)
     BCM2838State *s = (BCM2838State *)opaque;
 
     trace_bcm2838_gic_set_irq(irq, level);
-    qemu_set_irq(qdev_get_gpio_in(DEVICE(&s->gic), irq), level);
+    qemu_set_irq(qdev_get_gpio_in(DEVICE(&s->peripherals), irq), level);
 }
 
 static void bcm2838_init(Object *obj)
@@ -184,9 +184,20 @@ static void bcm2838_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&ps_base->aux), 0,
                        qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_AUX_UART1));
 
+    /* Connect RNG200 to its native GIC SPI. */
+    sysbus_connect_irq(SYS_BUS_DEVICE(&ps->rng), 0,
+                       qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_RNG200));
+
     /* Connect the I2C interrupt to the interrupt controller */
     qdev_connect_gpio_out(DEVICE(&ps_base->orgated_i2c_irq_splitter), 1,
                           qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_I2C));
+
+    /* Connect the four BCM2711 GPIO parent interrupt lines. */
+    for (int n = 0; n < BCM2838_GPIO_IRQS; n++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(&ps->gpio), n,
+                           qdev_get_gpio_in(gicdev,
+                                            GIC_SPI_INTERRUPT_GPIO_0 + n));
+    }
 
     /* Connect VC mailbox to the interrupt controller */
     sysbus_connect_irq(SYS_BUS_DEVICE(&ps_base->mboxes), 0,
@@ -208,6 +219,15 @@ static void bcm2838_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_MPHI));
     sysbus_connect_irq(SYS_BUS_DEVICE(&ps_base->dwc2), 0,
                        qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_DWC2));
+
+    /* Connect both GENET interrupt banks to their native GIC SPIs. */
+    sysbus_connect_irq(SYS_BUS_DEVICE(&ps->genet), 0,
+                       qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_GENET_A));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&ps->genet), 1,
+                       qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_GENET_B));
+
+    sysbus_connect_irq(SYS_BUS_DEVICE(&ps->aon_intr), 0,
+                       qdev_get_gpio_in(gicdev, GIC_SPI_INTERRUPT_AON));
 
     /* Connect DMA 0-6 to the interrupt controller */
     for (int n = GIC_SPI_INTERRUPT_DMA_0; n <= GIC_SPI_INTERRUPT_DMA_6; n++) {

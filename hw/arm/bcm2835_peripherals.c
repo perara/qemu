@@ -155,6 +155,10 @@ static void raspi_peripherals_base_init(Object *obj)
 
     /* CPRMAN clock manager */
     object_initialize_child(obj, "cprman", &s->cprman, TYPE_BCM2835_CPRMAN);
+    bcm2835_property_set_cprman(&s->property, &s->cprman);
+
+    /* Pulse-width modulator */
+    object_initialize_child(obj, "pwm", &s->pwm, TYPE_BCM2835_PWM);
 
     object_property_add_const_link(OBJECT(&s->dwc2), "dma-mr",
                                    OBJECT(&s->gpu_bus_mr));
@@ -291,6 +295,24 @@ void bcm_soc_peripherals_common_realize(DeviceState *dev, Error **errp)
                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->cprman), 0));
     qdev_connect_clock_in(DEVICE(&s->uart0), "clk",
                           qdev_get_clock_out(DEVICE(&s->cprman), "uart-out"));
+    qdev_connect_clock_in(DEVICE(&s->aux), "core",
+                          qdev_get_clock_out(DEVICE(&s->cprman), "vpu-out"));
+    qdev_connect_clock_in(DEVICE(&s->spi[0]), "core",
+                          qdev_get_clock_out(DEVICE(&s->cprman), "vpu-out"));
+    for (n = 0; n < ARRAY_SIZE(s->i2c); n++) {
+        qdev_connect_clock_in(DEVICE(&s->i2c[n]), "core",
+                              qdev_get_clock_out(DEVICE(&s->cprman),
+                                                 "vpu-out"));
+    }
+
+    /* Pulse-width modulator */
+    qdev_connect_clock_in(DEVICE(&s->pwm), "clk",
+                          qdev_get_clock_out(DEVICE(&s->cprman), "pwm-out"));
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->pwm), errp)) {
+        return;
+    }
+    memory_region_add_subregion(&s->peri_mr, PWM_OFFSET,
+                sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->pwm), 0));
 
     memory_region_add_subregion(&s->peri_mr, ARMCTRL_IC_OFFSET,
                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->ic), 0));
@@ -439,6 +461,18 @@ void bcm_soc_peripherals_common_realize(DeviceState *dev, Error **errp)
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->dma), errp)) {
         return;
     }
+    qdev_connect_gpio_out_named(
+        DEVICE(&s->sdhci), "dma-dreq", 0,
+        qdev_get_gpio_in_named(DEVICE(&s->dma), "dreq",
+                               BCM2835_DMA_DREQ_EMMC));
+    qdev_connect_gpio_out_named(
+        DEVICE(&s->pwm), "dma-threshold", 0,
+        qdev_get_gpio_in_named(DEVICE(&s->dma), "dreq",
+                               BCM2835_DMA_DREQ_PWM));
+    qdev_connect_gpio_out_named(
+        DEVICE(&s->pwm), "dma-threshold", 1,
+        qdev_get_gpio_in_named(DEVICE(&s->dma), "panic",
+                               BCM2835_DMA_DREQ_PWM));
 
     memory_region_add_subregion(&s->peri_mr, DMA_OFFSET,
                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->dma), 0));
@@ -484,6 +518,26 @@ void bcm_soc_peripherals_common_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in_named(DEVICE(&s->ic),
                                               BCM2835_IC_GPU_IRQ,
                                               INTERRUPT_SPI));
+    qdev_connect_gpio_out_named(
+        DEVICE(&s->spi[0]), "dma-threshold",
+        BCM2835_SPI_DMA_TX_DREQ,
+        qdev_get_gpio_in_named(DEVICE(&s->dma), "dreq",
+                               BCM2835_DMA_DREQ_SPI_TX));
+    qdev_connect_gpio_out_named(
+        DEVICE(&s->spi[0]), "dma-threshold",
+        BCM2835_SPI_DMA_RX_DREQ,
+        qdev_get_gpio_in_named(DEVICE(&s->dma), "dreq",
+                               BCM2835_DMA_DREQ_SPI_RX));
+    qdev_connect_gpio_out_named(
+        DEVICE(&s->spi[0]), "dma-threshold",
+        BCM2835_SPI_DMA_TX_PANIC,
+        qdev_get_gpio_in_named(DEVICE(&s->dma), "panic",
+                               BCM2835_DMA_DREQ_SPI_TX));
+    qdev_connect_gpio_out_named(
+        DEVICE(&s->spi[0]), "dma-threshold",
+        BCM2835_SPI_DMA_RX_PANIC,
+        qdev_get_gpio_in_named(DEVICE(&s->dma), "panic",
+                               BCM2835_DMA_DREQ_SPI_RX));
 
     /* I2C */
     for (n = 0; n < 3; n++) {

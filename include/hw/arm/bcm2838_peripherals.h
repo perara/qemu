@@ -10,8 +10,12 @@
 #define BCM2838_PERIPHERALS_H
 
 #include "hw/arm/bcm2835_peripherals.h"
+#include "hw/display/bcm2711_hdmi.h"
 #include "hw/sd/sdhci.h"
 #include "hw/gpio/bcm2838_gpio.h"
+#include "hw/i2c/bcm2711_hdmi_i2c.h"
+#include "hw/intc/bcm2711_aon_intr.h"
+#include "hw/net/bcm2711_genet.h"
 
 /* SPI */
 #define GIC_SPI_INTERRUPT_MBOX         33
@@ -22,12 +26,18 @@
 #define GIC_SPI_INTERRUPT_DMA_7_8      87
 #define GIC_SPI_INTERRUPT_DMA_9_10     88
 #define GIC_SPI_INTERRUPT_AUX_UART1    93
+#define GIC_SPI_INTERRUPT_AON          96
+#define GIC_SPI_INTERRUPT_GPIO_0       113
+#define GIC_SPI_INTERRUPT_GPIO_1       114
+#define GIC_SPI_INTERRUPT_GPIO_2       115
+#define GIC_SPI_INTERRUPT_GPIO_3       116
 #define GIC_SPI_INTERRUPT_I2C          117
 #define GIC_SPI_INTERRUPT_SDHOST       120
 #define GIC_SPI_INTERRUPT_UART0        121
 #define GIC_SPI_INTERRUPT_RNG200       125
 #define GIC_SPI_INTERRUPT_EMMC_EMMC2   126
 #define GIC_SPI_INTERRUPT_PCI_INT_A    143
+#define GIC_SPI_INTERRUPT_PCI_MSI      148
 #define GIC_SPI_INTERRUPT_GENET_A      157
 #define GIC_SPI_INTERRUPT_GENET_B      158
 
@@ -50,6 +60,16 @@
 
 #define BCM2838_MPHI_OFFSET     0xb200
 #define BCM2838_MPHI_SIZE       0x200
+#define BCM2711_GENET_OFFSET    0x1580000
+#define BCM2711_AON_INTR_OFFSET 0xf00100
+#define BCM2711_HDMI0_OFFSET    0xf00700
+#define BCM2711_HDMI1_OFFSET    0xf05700
+#define BCM2711_HDMI0_CEC_OFFSET 0xf04300
+#define BCM2711_HDMI1_CEC_OFFSET 0xf09300
+#define BCM2711_HDMI0_I2C_OFFSET 0xf04500
+#define BCM2711_HDMI0_AUTO_I2C_OFFSET 0xf00b00
+#define BCM2711_HDMI1_I2C_OFFSET 0xf09500
+#define BCM2711_HDMI1_AUTO_I2C_OFFSET 0xf05b00
 
 #define TYPE_BCM2838_PERIPHERALS "bcm2838-peripherals"
 OBJECT_DECLARE_TYPE(BCM2838PeripheralState, BCM2838PeripheralClass,
@@ -65,7 +85,14 @@ struct BCM2838PeripheralState {
     MemoryRegion mphi_mr_alias;
 
     SDHCIState emmc2;
+    BCM2835RngState rng;
+    Bcm2835ThermalState thermal2711;
+    BCM2835PwmState pwm1;
     BCM2838GpioState gpio;
+    BCM2711GenetState genet;
+    BCM2711AONIntrState aon_intr;
+    BCM2711HDMIState hdmi[2];
+    BCM2711HDMII2CState hdmi_i2c[2];
 
     OrIRQState mmc_irq_orgate;
     OrIRQState dma_7_8_irq_orgate;

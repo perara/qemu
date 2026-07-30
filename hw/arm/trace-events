@@ -96,3 +96,6 @@ z2_aer915_event(int8_t event, int8_t len) "i2c event =0x%x len=%d bytes"
 
 # bcm2838.c
 bcm2838_gic_set_irq(int irq, int level) "gic irq:%d lvl:%d"
+
+# raspi4b.c
+raspi4b_boot_event(const char *phase, const char *event, const char *source, const char *outcome, uint64_t value) "phase=%s event=%s source=%s outcome=%s value=0x%016"PRIx64

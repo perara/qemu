@@ -103,6 +103,7 @@ static const char *board_type(uint32_t board_rev)
     static const char *types[] = {
         "A", "B", "A+", "B+", "2B", "Alpha", "CM1", NULL, "3B", "Zero",
         "CM3", NULL, "Zero W", "3B+", "3A+", NULL, "CM3+", "4B",
+        "Zero 2 W", "400", "CM4",
     };
     assert(FIELD_EX32(board_rev, REV_CODE, STYLE)); /* Only new style */
     int bt = FIELD_EX32(board_rev, REV_CODE, TYPE);
@@ -244,11 +245,23 @@ static void setup_boot(MachineState *machine, ARMCPU *cpu,
 }
 
 void raspi_base_machine_init(MachineState *machine,
-                             BCM283XBaseState *soc)
+                             BCM283XBaseState *soc,
+                             BlockBackend *boot_storage,
+                             DeviceState *boot_controller,
+                             bool boot_emmc,
+                             BlockBackend *emmc_boot_storage,
+                             BlockBackend *emmc_rpmb_storage,
+                             const char *emmc_cid,
+                             uint64_t emmc_cache_size,
+                             bool emmc_cache_power_loss_on_reset,
+                             uint64_t emmc_cache_flush_sector_delay_us,
+                             uint64_t emmc_program_sector_delay_us,
+                             uint64_t emmc_erase_group_delay_us,
+                             uint32_t board_rev)
 {
-    RaspiBaseMachineClass *mc = RASPI_BASE_MACHINE_GET_CLASS(machine);
-    uint32_t board_rev = mc->board_rev;
+    RaspiBaseMachineState *s = RASPI_BASE_MACHINE(machine);
     uint64_t ram_size = board_ram_size(board_rev);
+    RaspiProcessorId processor_id = board_processor_id(board_rev);
     uint32_t vcram_base, vcram_size;
     size_t boot_ram_size;
     DriveInfo *di;
@@ -263,9 +276,35 @@ void raspi_base_machine_init(MachineState *machine,
         exit(1);
     }
 
-    /* FIXME: Remove when we have custom CPU address space support */
-    memory_region_add_subregion_overlap(get_system_memory(), 0,
-                                        machine->ram, 0);
+    /*
+     * BCM2711 reserves the top 64 MiB of the 32-bit physical address space
+     * for peripherals.  Real 4/8 GiB boards do not lose those DRAM bytes:
+     * the remainder is exposed from 4 GiB upward.  Keep machine->ram as one
+     * migration-visible backing store, but map it through aliases that model
+     * that physical hole.
+     *
+     * FIXME: Remove the aliases when the SoC has a custom CPU address space.
+     */
+    if (processor_id == PROCESSOR_ID_BCM2838) {
+        uint64_t low_size = MIN(ram_size, (uint64_t)BCM2838_PERI_LOW_BASE);
+
+        memory_region_init_alias(&s->ram_low_alias, OBJECT(machine),
+                                 "raspi-low-ram", machine->ram, 0, low_size);
+        memory_region_add_subregion_overlap(get_system_memory(), 0,
+                                            &s->ram_low_alias, 0);
+        if (ram_size > BCM2838_PERI_LOW_BASE) {
+            uint64_t high_size = ram_size - BCM2838_PERI_LOW_BASE;
+
+            memory_region_init_alias(
+                &s->ram_high_alias, OBJECT(machine), "raspi-high-ram",
+                machine->ram, BCM2838_PERI_LOW_BASE, high_size);
+            memory_region_add_subregion(get_system_memory(), 4 * GiB,
+                                        &s->ram_high_alias);
+        }
+    } else {
+        memory_region_add_subregion_overlap(get_system_memory(), 0,
+                                            machine->ram, 0);
+    }
 
     /* Setup the SOC */
     object_property_add_const_link(OBJECT(soc), "ram", OBJECT(machine->ram));
@@ -276,15 +315,39 @@ void raspi_base_machine_init(MachineState *machine,
     qdev_realize(DEVICE(soc), NULL, &error_fatal);
 
     /* Create and plug in the SD cards */
-    di = drive_get(IF_SD, 0, 0);
-    blk = di ? blk_by_legacy_dinfo(di) : NULL;
-    bus = qdev_get_child_bus(DEVICE(soc), "sd-bus");
+    di = boot_storage ? NULL : drive_get(IF_SD, 0, 0);
+    blk = boot_storage ? boot_storage :
+                         di ? blk_by_legacy_dinfo(di) : NULL;
+    bus = qdev_get_child_bus(boot_controller ? boot_controller : DEVICE(soc),
+                             "sd-bus");
     if (bus == NULL) {
         error_report("No SD bus found in SOC object");
         exit(1);
     }
-    carddev = qdev_new(TYPE_SD_CARD);
+    carddev = qdev_new(boot_emmc ? TYPE_EMMC : TYPE_SD_CARD);
     qdev_prop_set_drive_err(carddev, "drive", blk, &error_fatal);
+    if (emmc_boot_storage) {
+        qdev_prop_set_drive_err(carddev, "boot-partition-drive",
+                                emmc_boot_storage, &error_fatal);
+    }
+    if (emmc_rpmb_storage) {
+        qdev_prop_set_drive_err(carddev, "rpmb-partition-drive",
+                                emmc_rpmb_storage, &error_fatal);
+    }
+    if (emmc_cid) {
+        qdev_prop_set_string(carddev, "cid", emmc_cid);
+    }
+    if (boot_emmc) {
+        qdev_prop_set_uint64(carddev, "cache-size", emmc_cache_size);
+        qdev_prop_set_bit(carddev, "cache-power-loss-on-reset",
+                          emmc_cache_power_loss_on_reset);
+        qdev_prop_set_uint64(carddev, "cache-flush-sector-delay-us",
+                            emmc_cache_flush_sector_delay_us);
+        qdev_prop_set_uint64(carddev, "program-sector-delay-us",
+                            emmc_program_sector_delay_us);
+        qdev_prop_set_uint64(carddev, "erase-group-delay-us",
+                            emmc_erase_group_delay_us);
+    }
     qdev_realize_and_unref(carddev, bus, &error_fatal);
 
     vcram_size = object_property_get_uint(OBJECT(soc), "vcram-size",
@@ -297,7 +360,7 @@ void raspi_base_machine_init(MachineState *machine,
     }
     boot_ram_size = MIN(vcram_base, UPPER_RAM_BASE - vcram_size);
 
-    setup_boot(machine, &soc->cpu[0].core, board_processor_id(board_rev),
+    setup_boot(machine, &soc->cpu[0].core, processor_id,
                boot_ram_size);
 }
 
@@ -312,7 +375,9 @@ void raspi_machine_init(MachineState *machine)
 
     object_initialize_child(OBJECT(machine), "soc", soc,
                             board_soc_type(mc->board_rev));
-    raspi_base_machine_init(machine, &soc->parent_obj);
+    raspi_base_machine_init(machine, &soc->parent_obj, NULL, NULL, false,
+                            NULL, NULL, NULL, 0, false, 0, 0, 0,
+                            mc->board_rev);
 }
 
 void raspi_machine_class_common_init(MachineClass *mc,

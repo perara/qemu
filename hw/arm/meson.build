@@ -29,7 +29,16 @@ arm_common_ss.add(when: 'CONFIG_MAX78000_SOC', if_true: files('max78000_soc.c'))
 arm_common_ss.add(when: 'CONFIG_RASPI', if_true: files(
   'bcm2836.c',
   'bcm2838.c',
+  'raspi_boot.c',
+  'raspi_firmware.c',
+  'raspi_handoff.c',
+  'raspi_overlay.c',
+  'raspi_secure.c',
   'raspi.c',
+  'raspi4_network.c',
+  'raspi4_usbboot.c',
+  'raspi4_bootflow.c',
+  'raspi4_eeprom.c',
   'raspi4b.c'
 ))
 arm_common_ss.add(when: 'CONFIG_STM32F100_SOC', if_true: files('stm32f100_soc.c'))
