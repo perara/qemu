@@ -20,6 +20,8 @@
 
 static const Property i2c_props[] = {
     DEFINE_PROP_UINT8("address", struct I2CSlave, address, 0),
+    DEFINE_PROP_UINT16("ten-bit-address", struct I2CSlave, ten_bit_address,
+                       UINT16_MAX),
 };
 
 static const TypeInfo i2c_bus_info = {
@@ -33,9 +35,16 @@ static int i2c_bus_pre_save(void *opaque)
     I2CBus *bus = opaque;
 
     bus->saved_address = -1;
+    bus->saved_ten_bit_address = UINT16_MAX;
+    bus->saved_is_ten_bit = false;
     if (!QLIST_EMPTY(&bus->current_devs)) {
         if (!bus->broadcast) {
-            bus->saved_address = QLIST_FIRST(&bus->current_devs)->elt->address;
+            if (bus->active_is_ten_bit) {
+                bus->saved_ten_bit_address = bus->active_address;
+                bus->saved_is_ten_bit = true;
+            } else {
+                bus->saved_address = bus->active_address;
+            }
         } else {
             bus->saved_address = I2C_BROADCAST;
         }
@@ -44,13 +53,37 @@ static int i2c_bus_pre_save(void *opaque)
     return 0;
 }
 
+static int i2c_bus_post_load(void *opaque, int version_id)
+{
+    I2CBus *bus = opaque;
+
+    if (version_id < 2) {
+        bus->saved_ten_bit_address = UINT16_MAX;
+        bus->saved_is_ten_bit = false;
+    }
+    if (bus->saved_is_ten_bit) {
+        if (bus->saved_ten_bit_address > 0x3ff) {
+            return -EINVAL;
+        }
+        bus->active_address = bus->saved_ten_bit_address;
+        bus->active_is_ten_bit = true;
+    } else {
+        bus->active_address = bus->saved_address;
+        bus->active_is_ten_bit = false;
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_i2c_bus = {
     .name = "i2c_bus",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .pre_save = i2c_bus_pre_save,
+    .post_load = i2c_bus_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(saved_address, I2CBus),
+        VMSTATE_UINT16_V(saved_ten_bit_address, I2CBus, 2),
+        VMSTATE_BOOL_V(saved_is_ten_bit, I2CBus, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -63,6 +96,8 @@ I2CBus *i2c_init_bus(DeviceState *parent, const char *name)
     bus = I2C_BUS(qbus_new(TYPE_I2C_BUS, parent, name));
     QLIST_INIT(&bus->current_devs);
     QSIMPLEQ_INIT(&bus->pending_masters);
+    bus->saved_ten_bit_address = UINT16_MAX;
+    bus->active_address = UINT16_MAX;
     vmstate_register_any(NULL, &vmstate_i2c_bus, bus);
     return bus;
 }
@@ -78,7 +113,7 @@ int i2c_bus_busy(I2CBus *bus)
     return !QLIST_EMPTY(&bus->current_devs) || bus->bh;
 }
 
-bool i2c_scan_bus(I2CBus *bus, uint8_t address, bool broadcast,
+bool i2c_scan_bus(I2CBus *bus, uint16_t address, bool ten_bit, bool broadcast,
                   I2CNodeList *current_devs)
 {
     BusChild *kid;
@@ -88,7 +123,8 @@ bool i2c_scan_bus(I2CBus *bus, uint8_t address, bool broadcast,
         I2CSlave *candidate = I2C_SLAVE(qdev);
         I2CSlaveClass *sc = I2C_SLAVE_GET_CLASS(candidate);
 
-        if (sc->match_and_add(candidate, address, broadcast, current_devs)) {
+        if (sc->match_and_add(candidate, address, ten_bit, broadcast,
+                              current_devs)) {
             if (!broadcast) {
                 return true;
             }
@@ -118,14 +154,14 @@ bool i2c_scan_bus(I2CBus *bus, uint8_t address, bool broadcast,
  *
  * @event must be I2C_START_RECV or I2C_START_SEND.
  */
-static int i2c_do_start_transfer(I2CBus *bus, uint8_t address,
+static int i2c_do_start_transfer(I2CBus *bus, uint16_t address, bool ten_bit,
                                  enum i2c_event event)
 {
     I2CSlaveClass *sc;
     I2CNode *node;
     bool bus_scanned = false;
 
-    if (address == I2C_BROADCAST) {
+    if (!ten_bit && address == I2C_BROADCAST) {
         /*
          * This is a broadcast, the current_devs will be all the devices of the
          * bus.
@@ -143,12 +179,17 @@ static int i2c_do_start_transfer(I2CBus *bus, uint8_t address,
      */
     if (QLIST_EMPTY(&bus->current_devs)) {
         /* Disregard whether devices were found. */
-        (void)i2c_scan_bus(bus, address, bus->broadcast, &bus->current_devs);
+        (void)i2c_scan_bus(bus, address, ten_bit, bus->broadcast,
+                           &bus->current_devs);
         bus_scanned = true;
     }
 
     if (QLIST_EMPTY(&bus->current_devs)) {
         return 1;
+    }
+    if (bus_scanned) {
+        bus->active_address = address;
+        bus->active_is_ten_bit = ten_bit;
     }
 
     QLIST_FOREACH(node, &bus->current_devs, next) {
@@ -177,9 +218,18 @@ static int i2c_do_start_transfer(I2CBus *bus, uint8_t address,
 
 int i2c_start_transfer(I2CBus *bus, uint8_t address, bool is_recv)
 {
-    return i2c_do_start_transfer(bus, address, is_recv
-                                               ? I2C_START_RECV
-                                               : I2C_START_SEND);
+    return i2c_do_start_transfer(bus, address, false,
+                                 is_recv ? I2C_START_RECV : I2C_START_SEND);
+}
+
+int i2c_start_transfer_10bit(I2CBus *bus, uint16_t address, bool is_recv)
+{
+    if (address > 0x3ff) {
+        return 1;
+    }
+
+    return i2c_do_start_transfer(bus, address, true,
+                                 is_recv ? I2C_START_RECV : I2C_START_SEND);
 }
 
 void i2c_bus_master(I2CBus *bus, QEMUBH *bh)
@@ -221,17 +271,17 @@ void i2c_bus_release(I2CBus *bus)
 
 int i2c_start_recv(I2CBus *bus, uint8_t address)
 {
-    return i2c_do_start_transfer(bus, address, I2C_START_RECV);
+    return i2c_do_start_transfer(bus, address, false, I2C_START_RECV);
 }
 
 int i2c_start_send(I2CBus *bus, uint8_t address)
 {
-    return i2c_do_start_transfer(bus, address, I2C_START_SEND);
+    return i2c_do_start_transfer(bus, address, false, I2C_START_SEND);
 }
 
 int i2c_start_send_async(I2CBus *bus, uint8_t address)
 {
-    return i2c_do_start_transfer(bus, address, I2C_START_SEND_ASYNC);
+    return i2c_do_start_transfer(bus, address, false, I2C_START_SEND_ASYNC);
 }
 
 void i2c_end_transfer(I2CBus *bus)
@@ -250,6 +300,8 @@ void i2c_end_transfer(I2CBus *bus)
         g_free(node);
     }
     bus->broadcast = false;
+    bus->active_address = UINT16_MAX;
+    bus->active_is_ten_bit = false;
 }
 
 int i2c_send(I2CBus *bus, uint8_t data)
@@ -308,6 +360,23 @@ uint8_t i2c_recv(I2CBus *bus)
     return data;
 }
 
+uint32_t i2c_get_stretch_cycles(I2CBus *bus, bool is_recv,
+                                uint32_t byte_index)
+{
+    I2CNode *node;
+    uint32_t cycles = 0;
+
+    QLIST_FOREACH(node, &bus->current_devs, next) {
+        I2CSlaveClass *sc = I2C_SLAVE_GET_CLASS(node->elt);
+
+        if (sc->stretch) {
+            cycles = MAX(cycles, sc->stretch(node->elt, is_recv,
+                                             byte_index));
+        }
+    }
+    return cycles;
+}
+
 void i2c_nack(I2CBus *bus)
 {
     I2CSlaveClass *sc;
@@ -343,8 +412,13 @@ static int i2c_slave_post_load(void *opaque, int version_id)
     I2CBus *bus;
     I2CNode *node;
 
+    if (version_id < 2) {
+        dev->ten_bit_address = UINT16_MAX;
+    }
     bus = I2C_BUS(qdev_get_parent_bus(DEVICE(dev)));
-    if ((bus->saved_address == dev->address) ||
+    if ((bus->saved_is_ten_bit &&
+         bus->saved_ten_bit_address == dev->ten_bit_address) ||
+        (!bus->saved_is_ten_bit && bus->saved_address == dev->address) ||
         (bus->saved_address == I2C_BROADCAST)) {
         node = g_new(struct I2CNode, 1);
         node->elt = dev;
@@ -355,11 +429,12 @@ static int i2c_slave_post_load(void *opaque, int version_id)
 
 const VMStateDescription vmstate_i2c_slave = {
     .name = "I2CSlave",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = i2c_slave_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(address, I2CSlave),
+        VMSTATE_UINT16_V(ten_bit_address, I2CSlave, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -387,10 +462,14 @@ I2CSlave *i2c_slave_create_simple(I2CBus *bus, const char *name, uint8_t addr)
     return dev;
 }
 
-static bool i2c_slave_match(I2CSlave *candidate, uint8_t address,
-                            bool broadcast, I2CNodeList *current_devs)
+static bool i2c_slave_match(I2CSlave *candidate, uint16_t address,
+                            bool ten_bit, bool broadcast,
+                            I2CNodeList *current_devs)
 {
-    if ((candidate->address == address) || (broadcast)) {
+    bool matched = ten_bit ? candidate->ten_bit_address == address :
+                             candidate->address == address;
+
+    if (matched || broadcast) {
         I2CNode *node = g_new(struct I2CNode, 1);
         node->elt = candidate;
         QLIST_INSERT_HEAD(current_devs, node, next);

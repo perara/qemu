@@ -39,6 +39,12 @@ struct I2CSlaveClass {
     uint8_t (*recv)(I2CSlave *s);
 
     /*
+     * Optional controller-visible SCL stretching request, in serial clock
+     * cycles, before the indexed byte.  A zero return means no stretch.
+     */
+    uint32_t (*stretch)(I2CSlave *s, bool is_recv, uint32_t byte_index);
+
+    /*
      * Notify the slave of a bus state change.  For start event,
      * returns non-zero to NAK an operation.  For other events the
      * return code is not used and should be zero.
@@ -52,7 +58,8 @@ struct I2CSlaveClass {
      *
      * If broadcast is true, match should add the device and return true.
      */
-    bool (*match_and_add)(I2CSlave *candidate, uint8_t address, bool broadcast,
+    bool (*match_and_add)(I2CSlave *candidate, uint16_t address,
+                          bool ten_bit, bool broadcast,
                           I2CNodeList *current_devs);
 };
 
@@ -61,6 +68,7 @@ struct I2CSlave {
 
     /* Remaining fields for internal use by the I2C code.  */
     uint8_t address;
+    uint16_t ten_bit_address;
 };
 
 #define TYPE_I2C_BUS "i2c-bus"
@@ -88,6 +96,10 @@ struct I2CBus {
     I2CNodeList current_devs;
     I2CPendingMasters pending_masters;
     uint8_t saved_address;
+    uint16_t saved_ten_bit_address;
+    uint16_t active_address;
+    bool saved_is_ten_bit;
+    bool active_is_ten_bit;
     bool broadcast;
 
     /* Set from slave currently mastering the bus. */
@@ -110,6 +122,17 @@ int i2c_bus_busy(I2CBus *bus);
  * Returns: 0 on success, -1 on error
  */
 int i2c_start_transfer(I2CBus *bus, uint8_t address, bool is_recv);
+
+/**
+ * i2c_start_transfer_10bit: start a transfer to a 10-bit I2C target.
+ *
+ * @bus: #I2CBus to be used
+ * @address: 10-bit target address
+ * @is_recv: indicates the transfer direction
+ *
+ * Returns: 0 on success, -1 on error
+ */
+int i2c_start_transfer_10bit(I2CBus *bus, uint16_t address, bool is_recv);
 
 /**
  * i2c_start_recv: start a 'receive' transfer on an I2C bus.
@@ -151,7 +174,9 @@ void i2c_bus_release(I2CBus *bus);
 int i2c_send(I2CBus *bus, uint8_t data);
 int i2c_send_async(I2CBus *bus, uint8_t data);
 uint8_t i2c_recv(I2CBus *bus);
-bool i2c_scan_bus(I2CBus *bus, uint8_t address, bool broadcast,
+uint32_t i2c_get_stretch_cycles(I2CBus *bus, bool is_recv,
+                                uint32_t byte_index);
+bool i2c_scan_bus(I2CBus *bus, uint16_t address, bool ten_bit, bool broadcast,
                   I2CNodeList *current_devs);
 
 /**

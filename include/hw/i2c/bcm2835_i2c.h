@@ -25,8 +25,10 @@
  */
 
 #include "hw/core/sysbus.h"
+#include "hw/core/clock.h"
 #include "hw/i2c/i2c.h"
 #include "qom/object.h"
+#include "qemu/timer.h"
 
 #define TYPE_BCM2835_I2C "bcm2835-i2c"
 OBJECT_DECLARE_SIMPLE_TYPE(BCM2835I2CState, BCM2835_I2C)
@@ -47,6 +49,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2835I2CState, BCM2835_I2C)
 #define BCM2835_I2C_C_ST        BIT(7)            /* Start transfer */
 #define BCM2835_I2C_C_CLEAR     (BIT(5) | BIT(4)) /* Clear FIFO */
 #define BCM2835_I2C_C_READ      BIT(0)            /* I2C read mode */
+#define BCM2835_I2C_C_MASK      (BCM2835_I2C_C_I2CEN | \
+                                 BCM2835_I2C_C_INTR | \
+                                 BCM2835_I2C_C_INTT | \
+                                 BCM2835_I2C_C_INTD | \
+                                 BCM2835_I2C_C_READ)
 
 #define BCM2835_I2C_S_CLKT      BIT(9)            /* Clock stretch timeout */
 #define BCM2835_I2C_S_ERR       BIT(8)            /* Slave error */
@@ -59,6 +66,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2835I2CState, BCM2835_I2C)
 #define BCM2835_I2C_S_DONE      BIT(1)            /* I2C Transfer complete */
 #define BCM2835_I2C_S_TA        BIT(0)            /* I2C Transfer active */
 
+#define BCM2835_I2C_FIFO_LEN        16
+#define BCM2835_I2C_RXR_THRESHOLD   12
+#define BCM2835_I2C_TXW_THRESHOLD   4
+
 struct BCM2835I2CState {
     /* <private> */
     SysBusDevice parent_obj;
@@ -67,6 +78,8 @@ struct BCM2835I2CState {
     MemoryRegion iomem;
     I2CBus *bus;
     qemu_irq irq;
+    Clock *core_clk;
+    QEMUTimer *stretch_timer;
 
     uint32_t c;
     uint32_t s;
@@ -77,4 +90,20 @@ struct BCM2835I2CState {
     uint32_t clkt;
 
     uint32_t last_dlen;
+    uint8_t fifo[BCM2835_I2C_FIFO_LEN];
+    uint8_t fifo_pos;
+    uint8_t fifo_len;
+    QEMUBH *transfer_bh;
+
+    uint32_t clock_stretch_after;
+    uint32_t clock_stretch_cycles;
+    uint32_t transfer_bytes;
+    uint32_t stretch_remaining_cycles;
+    uint16_t ten_bit_address;
+    bool stretch_injected;
+    bool stretch_completed;
+    bool stretch_waiting;
+    bool stretch_timeout;
+    bool ten_bit_address_valid;
+    bool ten_bit_address_pending;
 };

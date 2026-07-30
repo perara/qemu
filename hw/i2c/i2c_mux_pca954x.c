@@ -64,8 +64,8 @@ OBJECT_DECLARE_TYPE(Pca954xState, Pca954xClass, PCA954X)
 /*
  * For each channel, if it's enabled, recursively call match on those children.
  */
-static bool pca954x_match(I2CSlave *candidate, uint8_t address,
-                          bool broadcast,
+static bool pca954x_match(I2CSlave *candidate, uint16_t address,
+                          bool ten_bit, bool broadcast,
                           I2CNodeList *current_devs)
 {
     Pca954xState *mux = PCA954X(candidate);
@@ -73,7 +73,7 @@ static bool pca954x_match(I2CSlave *candidate, uint8_t address,
     int i;
 
     /* They are talking to the mux itself (or all devices enabled). */
-    if ((candidate->address == address) || broadcast) {
+    if ((!ten_bit && candidate->address == address) || broadcast) {
         I2CNode *node = g_new(struct I2CNode, 1);
         node->elt = candidate;
         QLIST_INSERT_HEAD(current_devs, node, next);
@@ -87,7 +87,7 @@ static bool pca954x_match(I2CSlave *candidate, uint8_t address,
             continue;
         }
 
-        if (i2c_scan_bus(mux->bus[i], address, broadcast,
+        if (i2c_scan_bus(mux->bus[i], address, ten_bit, broadcast,
                          current_devs)) {
             if (!broadcast) {
                 return true;
