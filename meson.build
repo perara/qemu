@@ -4543,7 +4543,53 @@ if have_tools
     subdir('contrib/vhost-user-scsi')
   endif
 
+  qemu_rpi_qgpio_core_test = executable(
+    'qemu-rpi-qgpio-core-test',
+    files(
+      'contrib/raspi4/gpio_adapter/qgpio_core.c',
+      'contrib/raspi4/gpio_adapter/qgpio_core_test.c',
+    ),
+    include_directories: include_directories(
+      'contrib/raspi4/gpio_adapter',
+    ),
+    install: false)
+  test('qemu-rpi-qgpio-core-self-test', qemu_rpi_qgpio_core_test,
+       suite: 'unit', timeout: 30)
+
   if host_os == 'linux'
+    qemu_rpi_rpiboot = executable(
+      'qemu-rpi-rpiboot-raw-gadget',
+      files('contrib/raspi4/rpiboot_raw_gadget.c'),
+      dependencies: threads,
+      install: false)
+    test('qemu-rpi-rpiboot-self-test', qemu_rpi_rpiboot,
+         args: ['--self-test'], suite: 'unit', timeout: 30)
+
+    qemu_rpi_dwc2_proxy = executable(
+      'qemu-rpi-dwc2-raw-gadget-proxy',
+      files('contrib/raspi4/dwc2_raw_gadget_proxy.c'),
+      dependencies: threads,
+      install: false)
+    test('qemu-rpi-dwc2-proxy-self-test', qemu_rpi_dwc2_proxy,
+         args: ['--self-test'], suite: 'unit', timeout: 30)
+
+    qemu_rpi_cm4_msd = executable(
+      'qemu-rpi-cm4-msd',
+      files('contrib/raspi4/cm4_msd_raw_gadget.c'),
+      dependencies: threads,
+      install: false)
+    test('qemu-rpi-cm4-msd-self-test', qemu_rpi_cm4_msd,
+         args: ['--self-test'], suite: 'unit', timeout: 30)
+    if libusb.found()
+      qemu_rpi_cm4_bot_probe = executable(
+        'qemu-rpi-cm4-bot-probe',
+        files('contrib/raspi4/cm4_msd_bot_probe.c'),
+        dependencies: libusb,
+        install: false)
+      test('qemu-rpi-cm4-bot-probe-self-test', qemu_rpi_cm4_bot_probe,
+           args: ['--self-test'], suite: 'unit', timeout: 30)
+    endif
+
     executable('qemu-bridge-helper', files('qemu-bridge-helper.c'),
                dependencies: [qemuutil, libcap_ng],
                install: true,
