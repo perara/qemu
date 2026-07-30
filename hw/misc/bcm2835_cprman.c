@@ -263,10 +263,30 @@ static bool clock_mux_is_enabled(CprmanClockMuxState *mux)
     return FIELD_EX32(*mux->reg_ctl, CM_CLOCKx_CTL, ENABLE);
 }
 
+static uint64_t clock_mux_get_rate(CprmanClockMuxState *mux)
+{
+    uint32_t src = FIELD_EX32(*mux->reg_ctl, CM_CLOCKx_CTL, SRC);
+    uint64_t div;
+    uint64_t freq;
+
+    if (src >= CPRMAN_NUM_CLOCK_MUX_SRC) {
+        return 0;
+    }
+    freq = clock_get_hz(mux->srcs[src]);
+    if (mux->int_bits == 0 && mux->frac_bits == 0) {
+        return freq;
+    }
+    div = extract32(*mux->reg_div,
+                    R_CM_CLOCKx_DIV_FRAC_LENGTH - mux->frac_bits,
+                    mux->int_bits + mux->frac_bits);
+    if (!div) {
+        return 0;
+    }
+    return muldiv64(freq, 1 << mux->frac_bits, div);
+}
+
 static void clock_mux_update(CprmanClockMuxState *mux)
 {
-    uint64_t freq;
-    uint32_t div, src = FIELD_EX32(*mux->reg_ctl, CM_CLOCKx_CTL, SRC);
     bool enabled = clock_mux_is_enabled(mux);
 
     *mux->reg_ctl = FIELD_DP32(*mux->reg_ctl, CM_CLOCKx_CTL, BUSY, enabled);
@@ -275,38 +295,74 @@ static void clock_mux_update(CprmanClockMuxState *mux)
         clock_update(mux->out, 0);
         return;
     }
+    clock_update_hz(mux->out, clock_mux_get_rate(mux));
+}
 
-    freq = clock_get_hz(mux->srcs[src]);
+bool bcm2835_cprman_clock_is_enabled(BCM2835CprmanState *s,
+                                     CprmanClockMux id)
+{
+    assert(id >= 0 && id < CPRMAN_NUM_CLOCK_MUX);
+    return clock_mux_is_enabled(&s->clock_muxes[id]);
+}
 
+uint64_t bcm2835_cprman_clock_get_rate(BCM2835CprmanState *s,
+                                       CprmanClockMux id)
+{
+    assert(id >= 0 && id < CPRMAN_NUM_CLOCK_MUX);
+    return clock_mux_get_rate(&s->clock_muxes[id]);
+}
+
+uint64_t bcm2835_cprman_clock_get_measured_rate(BCM2835CprmanState *s,
+                                                CprmanClockMux id)
+{
+    assert(id >= 0 && id < CPRMAN_NUM_CLOCK_MUX);
+    return clock_get_hz(s->clock_muxes[id].out);
+}
+
+void bcm2835_cprman_clock_set_enabled(BCM2835CprmanState *s,
+                                      CprmanClockMux id, bool enabled)
+{
+    CprmanClockMuxState *mux;
+
+    assert(id >= 0 && id < CPRMAN_NUM_CLOCK_MUX);
+    mux = &s->clock_muxes[id];
+    *mux->reg_ctl = FIELD_DP32(*mux->reg_ctl, CM_CLOCKx_CTL, ENABLE,
+                               enabled);
+    clock_mux_update(mux);
+}
+
+uint64_t bcm2835_cprman_clock_set_rate(BCM2835CprmanState *s,
+                                       CprmanClockMux id, uint64_t hz)
+{
+    CprmanClockMuxState *mux;
+    uint32_t src;
+    uint64_t source_hz;
+    uint64_t divider;
+    uint64_t max_divider;
+
+    assert(id >= 0 && id < CPRMAN_NUM_CLOCK_MUX);
+    mux = &s->clock_muxes[id];
+    src = FIELD_EX32(*mux->reg_ctl, CM_CLOCKx_CTL, SRC);
+    if (src >= CPRMAN_NUM_CLOCK_MUX_SRC) {
+        return 0;
+    }
+    source_hz = clock_get_hz(mux->srcs[src]);
     if (mux->int_bits == 0 && mux->frac_bits == 0) {
-        clock_update_hz(mux->out, freq);
-        return;
+        return source_hz;
     }
-
-    /*
-     * The divider has an integer and a fractional part. The size of each part
-     * varies with the muxes (int_bits and frac_bits). Both parts are
-     * concatenated, with the integer part always starting at bit 12.
-     *
-     *         31          12 11          0
-     *        ------------------------------
-     * CM_DIV |      |  int  |  frac  |    |
-     *        ------------------------------
-     *                <-----> <------>
-     *                int_bits frac_bits
-     */
-    div = extract32(*mux->reg_div,
-                    R_CM_CLOCKx_DIV_FRAC_LENGTH - mux->frac_bits,
-                    mux->int_bits + mux->frac_bits);
-
-    if (!div) {
-        clock_update(mux->out, 0);
-        return;
+    max_divider = MAKE_64BIT_MASK(0, mux->int_bits + mux->frac_bits);
+    if (!hz || !source_hz) {
+        divider = 0;
+    } else {
+        divider = ((source_hz << mux->frac_bits) + hz / 2) / hz;
+        divider = CLAMP(divider, 1ULL << mux->frac_bits, max_divider);
     }
-
-    freq = muldiv64(freq, 1 << mux->frac_bits, div);
-
-    clock_update_hz(mux->out, freq);
+    *mux->reg_div = deposit32(
+        *mux->reg_div,
+        R_CM_CLOCKx_DIV_FRAC_LENGTH - mux->frac_bits,
+        mux->int_bits + mux->frac_bits, divider);
+    clock_mux_update(mux);
+    return clock_mux_get_rate(mux);
 }
 
 static void clock_mux_src_update(void *opaque, ClockEvent event)
@@ -508,7 +564,7 @@ static inline void update_mux_from_cm(BCM2835CprmanState *s, size_t idx)
 
     for (i = 0; i < CPRMAN_NUM_CLOCK_MUX; i++) {
         if ((CLOCK_MUX_INIT_INFO[i].cm_offset == idx) ||
-            (CLOCK_MUX_INIT_INFO[i].cm_offset + 4 == idx)) {
+            (CLOCK_MUX_INIT_INFO[i].cm_offset + 1 == idx)) {
             /* matches CM_CTL or CM_DIV mux register */
             clock_mux_update(&s->clock_muxes[i]);
             return;
@@ -628,6 +684,7 @@ static const MemoryRegionOps cprman_ops = {
 static void cprman_reset(DeviceState *dev)
 {
     BCM2835CprmanState *s = CPRMAN(dev);
+    CprmanClockMuxState *vpu = &s->clock_muxes[CPRMAN_CLOCK_VPU];
     size_t i;
 
     memset(s->regs, 0, sizeof(s->regs));
@@ -647,6 +704,37 @@ static void cprman_reset(DeviceState *dev)
     }
 
     clock_update_hz(s->xosc, s->xosc_freq);
+    if (s->vpu_clock_reset_hz) {
+        uint32_t src = FIELD_EX32(*vpu->reg_ctl, CM_CLOCKx_CTL, SRC);
+        uint64_t source_hz = clock_get_hz(vpu->srcs[src]);
+        uint64_t divider;
+
+        /*
+         * BCM2711 firmware keeps the VPU core clock fixed at 250 MHz when
+         * the mini UART is enabled.  Preserve a register-consistent reset
+         * state so subsequent guest CPRMAN writes take effect normally.
+         */
+        divider = ((source_hz << vpu->frac_bits) +
+                   s->vpu_clock_reset_hz / 2) /
+                  s->vpu_clock_reset_hz;
+        if (source_hz && divider &&
+            divider <= MAKE_64BIT_MASK(0, vpu->int_bits + vpu->frac_bits)) {
+            *vpu->reg_div = deposit32(
+                *vpu->reg_div,
+                R_CM_CLOCKx_DIV_FRAC_LENGTH - vpu->frac_bits,
+                vpu->int_bits + vpu->frac_bits, divider);
+            *vpu->reg_ctl = FIELD_DP32(
+                *vpu->reg_ctl, CM_CLOCKx_CTL, ENABLE, 1);
+            clock_mux_update(vpu);
+        }
+    }
+    /*
+     * A reset changes mux registers directly.  Resynchronize every exported
+     * clock even when its selected source did not emit an update event.
+     */
+    for (i = 0; i < CPRMAN_NUM_CLOCK_MUX; i++) {
+        clock_mux_update(&s->clock_muxes[i]);
+    }
 }
 
 static void cprman_init(Object *obj)
@@ -776,10 +864,36 @@ static void cprman_realize(DeviceState *dev, Error **errp)
     }
 }
 
+static int cprman_post_load(void *opaque, int version_id)
+{
+    BCM2835CprmanState *s = opaque;
+    size_t i;
+
+    for (i = 0; i < CPRMAN_NUM_PLL; i++) {
+        pll_update_all_channels(s, &s->plls[i]);
+    }
+    dsi0hsck_mux_update(&s->dsi0hsck_mux);
+
+    /*
+     * Clock VMState restores input periods without invoking callbacks.
+     * Rebuild derived outputs from the migrated registers after every child
+     * clock has loaded.  TD0/TD1 feed selectable sources of the other muxes.
+     */
+    clock_mux_update(&s->clock_muxes[CPRMAN_CLOCK_TD0]);
+    clock_mux_update(&s->clock_muxes[CPRMAN_CLOCK_TD1]);
+    for (i = 0; i < CPRMAN_NUM_CLOCK_MUX; i++) {
+        if (i != CPRMAN_CLOCK_TD0 && i != CPRMAN_CLOCK_TD1) {
+            clock_mux_update(&s->clock_muxes[i]);
+        }
+    }
+    return 0;
+}
+
 static const VMStateDescription cprman_vmstate = {
     .name = TYPE_BCM2835_CPRMAN,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = cprman_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, BCM2835CprmanState, CPRMAN_NUM_REGS),
         VMSTATE_END_OF_LIST()

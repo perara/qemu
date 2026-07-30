@@ -22,6 +22,9 @@ struct Bcm2835ThermalState {
     /*< public >*/
     MemoryRegion iomem;
     uint32_t ctl;
+    int32_t temperature_millicelsius;
+    bool sensor_valid;
+    bool bcm2711;
 };
 
 #endif

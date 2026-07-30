@@ -50,6 +50,10 @@ struct TMP105State {
      * looking for T_high, true when looking for T_low.
      */
     bool detect_falling;
+
+    uint32_t test_clock_stretch_after;
+    uint32_t test_clock_stretch_cycles;
+    uint32_t test_nack_after;
 };
 
 #endif

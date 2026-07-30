@@ -202,9 +202,21 @@ struct BCM2835CprmanState {
 
     uint32_t regs[CPRMAN_NUM_REGS];
     uint32_t xosc_freq;
+    uint32_t vpu_clock_reset_hz;
 
     Clock *xosc;
     Clock *gnd;
 };
+
+bool bcm2835_cprman_clock_is_enabled(BCM2835CprmanState *s,
+                                     CprmanClockMux id);
+uint64_t bcm2835_cprman_clock_get_rate(BCM2835CprmanState *s,
+                                       CprmanClockMux id);
+uint64_t bcm2835_cprman_clock_get_measured_rate(BCM2835CprmanState *s,
+                                                CprmanClockMux id);
+void bcm2835_cprman_clock_set_enabled(BCM2835CprmanState *s,
+                                      CprmanClockMux id, bool enabled);
+uint64_t bcm2835_cprman_clock_set_rate(BCM2835CprmanState *s,
+                                       CprmanClockMux id, uint64_t hz);
 
 #endif

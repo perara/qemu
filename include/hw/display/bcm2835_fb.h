@@ -32,6 +32,13 @@ typedef struct {
     uint32_t base;
     uint32_t pixo;
     uint32_t alpha;
+    uint32_t overscan_top;
+    uint32_t overscan_bottom;
+    uint32_t overscan_left;
+    uint32_t overscan_right;
+    uint32_t layer;
+    uint32_t transform;
+    uint32_t vsync;
 } BCM2835FBConfig;
 
 struct BCM2835FBState {
@@ -47,13 +54,28 @@ struct BCM2835FBState {
     QemuConsole *con;
     qemu_irq mbox_irq;
 
-    bool lock, invalidate, pending;
+    bool lock, invalidate, pending, blank, enabled;
+    bool cursor_info_valid, cursor_enabled;
+    uint32_t cursor_width, cursor_height;
+    uint32_t cursor_address;
+    uint32_t cursor_hotspot_x, cursor_hotspot_y;
+    uint32_t cursor_x, cursor_y, cursor_flags;
 
     BCM2835FBConfig config;
     BCM2835FBConfig initial_config;
 };
 
 void bcm2835_fb_reconfigure(BCM2835FBState *s, BCM2835FBConfig *newconfig);
+void bcm2835_fb_set_blank(BCM2835FBState *s, bool blank);
+void bcm2835_fb_set_enabled(BCM2835FBState *s, bool enabled);
+bool bcm2835_fb_set_cursor_info(BCM2835FBState *s, uint32_t width,
+                                uint32_t height, uint32_t address,
+                                uint32_t hotspot_x, uint32_t hotspot_y);
+bool bcm2835_fb_set_cursor_state(BCM2835FBState *s, uint32_t enable,
+                                 uint32_t x, uint32_t y, uint32_t flags);
+bool bcm2835_fb_set_overscan(BCM2835FBConfig *config, uint32_t top,
+                             uint32_t bottom, uint32_t left,
+                             uint32_t right);
 
 /**
  * bcm2835_fb_get_pitch: return number of bytes per line of the framebuffer

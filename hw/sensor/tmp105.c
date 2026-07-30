@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
 #include "hw/sensor/tmp105.h"
@@ -198,6 +199,9 @@ static int tmp105_tx(I2CSlave *i2c, uint8_t data)
 {
     TMP105State *s = TMP105(i2c);
 
+    if (s->len == s->test_nack_after) {
+        return 1;
+    }
     if (s->len == 0) {
         s->pointer = data;
         s->len++;
@@ -210,6 +214,15 @@ static int tmp105_tx(I2CSlave *i2c, uint8_t data)
     }
 
     return 0;
+}
+
+static uint32_t tmp105_stretch(I2CSlave *i2c, bool is_recv,
+                              uint32_t byte_index)
+{
+    TMP105State *s = TMP105(i2c);
+
+    return byte_index == s->test_clock_stretch_after ?
+           s->test_clock_stretch_cycles : 0;
 }
 
 static int tmp105_event(I2CSlave *i2c, enum i2c_event event)
@@ -313,6 +326,15 @@ static void tmp105_initfn(Object *obj)
                         tmp105_set_temperature, NULL, NULL);
 }
 
+static const Property tmp105_properties[] = {
+    DEFINE_PROP_UINT32("test-clock-stretch-after", TMP105State,
+                       test_clock_stretch_after, UINT32_MAX),
+    DEFINE_PROP_UINT32("test-clock-stretch-cycles", TMP105State,
+                       test_clock_stretch_cycles, 0),
+    DEFINE_PROP_UINT32("test-nack-after", TMP105State, test_nack_after,
+                       UINT32_MAX),
+};
+
 static void tmp105_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -322,7 +344,9 @@ static void tmp105_class_init(ObjectClass *klass, const void *data)
     k->event = tmp105_event;
     k->recv = tmp105_rx;
     k->send = tmp105_tx;
+    k->stretch = tmp105_stretch;
     dc->vmsd = &vmstate_tmp105;
+    device_class_set_props(dc, tmp105_properties);
 }
 
 static const TypeInfo tmp105_info = {

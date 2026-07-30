@@ -11,6 +11,7 @@
 #define BCM2835_RNG_H
 
 #include "hw/core/sysbus.h"
+#include "qemu/fifo8.h"
 #include "qom/object.h"
 
 #define TYPE_BCM2835_RNG "bcm2835-rng"
@@ -19,9 +20,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2835RngState, BCM2835_RNG)
 struct BCM2835RngState {
     SysBusDevice busdev;
     MemoryRegion iomem;
+    qemu_irq irq;
+    Fifo8 fifo;
 
     uint32_t rng_ctrl;
     uint32_t rng_status;
+    uint32_t total_bit_count;
+    uint32_t total_bit_count_threshold;
+    uint32_t int_status;
+    uint32_t int_enable;
+    uint32_t fifo_threshold;
+    uint32_t deterministic_seed;
+    uint32_t prng_state;
+    bool rng200;
+    bool rng200_refill;
+    bool rng200_nist_fail;
+    bool rng200_master_fail;
 };
 
 #endif
