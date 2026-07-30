@@ -1,0 +1,66 @@
+{
+  "$comment": "/* SPDX-License-Identifier: GPL-2.0-or-later */",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qemu.org/schemas/raspi4/boot-trace-v1.json",
+  "title": "Raspberry Pi 4 and CM4 boot trace record, version 1",
+  "description": "One JSON object per line. The first record is a header and all remaining records are ordered boot events.",
+  "oneOf": [
+    { "$ref": "#/$defs/header" },
+    { "$ref": "#/$defs/event" }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "header": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record", "schema", "version", "platform", "producer", "artifacts"],
+      "properties": {
+        "record": { "const": "header" },
+        "schema": { "const": "qemu.raspi.boot-trace" },
+        "version": { "const": 1 },
+        "platform": { "enum": ["raspi4b", "cm4"] },
+        "producer": { "enum": ["qemu", "hardware"] },
+        "capture_id": { "type": "string", "minLength": 1 },
+        "started_utc": { "type": "string", "format": "date-time" },
+        "artifacts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["board_revision"],
+          "properties": {
+            "board_revision": { "type": "string", "pattern": "^(0x)?[0-9a-fA-F]+$" },
+            "eeprom_release": { "type": "string" },
+            "eeprom_sha256": { "$ref": "#/$defs/sha256" },
+            "firmware_release": { "type": "string" },
+            "firmware_sha256": { "$ref": "#/$defs/sha256" },
+            "media_sha256": { "$ref": "#/$defs/sha256" },
+            "otp_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record", "seq", "phase", "event"],
+      "properties": {
+        "record": { "const": "event" },
+        "seq": { "type": "integer", "minimum": 0 },
+        "time_us": { "type": "integer", "minimum": 0 },
+        "phase": {
+          "enum": ["reset", "rom", "recovery", "eeprom", "boot-source", "firmware", "handoff", "kernel", "health", "fault"]
+        },
+        "event": { "type": "string", "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$" },
+        "source": {
+          "enum": ["sd-card-detect", "sd-card", "emmc", "network", "rpiboot", "usb-msd", "bcm-usb-msd", "nvme", "http", "stop", "restart"]
+        },
+        "outcome": {
+          "enum": ["start", "success", "failure", "timeout", "unsupported", "wait", "retry", "watchdog", "stop", "restart"]
+        },
+        "data": { "type": "object" }
+      }
+    }
+  }
+}
