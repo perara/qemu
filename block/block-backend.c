@@ -2544,6 +2544,12 @@ void blk_add_remove_bs_notifier(BlockBackend *blk, Notifier *notify)
     notifier_list_add(&blk->remove_bs_notifiers, notify);
 }
 
+void blk_add_insert_bs_notifier(BlockBackend *blk, Notifier *notify)
+{
+    GLOBAL_STATE_CODE();
+    notifier_list_add(&blk->insert_bs_notifiers, notify);
+}
+
 BlockAcctStats *blk_get_stats(BlockBackend *blk)
 {
     IO_CODE();
