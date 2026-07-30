@@ -43,6 +43,7 @@ struct CpuOnInfo {
     uint64_t context_id;
     uint32_t target_el;
     bool target_aa64;
+    bool target_big_endian;
 };
 
 
@@ -54,7 +55,18 @@ static void arm_set_cpu_on_async_work(CPUState *target_cpu_state,
 
     /* Initialize the cpu we are turning on */
     cpu_reset(target_cpu_state);
+    if (!info->target_aa64 && target_cpu->env.aarch64) {
+        target_cpu->env.aarch64 = false;
+        aarch64_sync_64_to_32(&target_cpu->env);
+    }
     arm_emulate_firmware_reset(target_cpu_state, info->target_el);
+    if (info->target_aa64) {
+        if (info->target_big_endian) {
+            target_cpu->env.cp15.sctlr_el[info->target_el] |= SCTLR_EE;
+        } else {
+            target_cpu->env.cp15.sctlr_el[info->target_el] &= ~SCTLR_EE;
+        }
+    }
     target_cpu_state->halted = 0;
 
     /* We check if the started CPU is now at the correct level */
@@ -81,8 +93,10 @@ static void arm_set_cpu_on_async_work(CPUState *target_cpu_state,
     arm_set_cpu_power_state(target_cpu, PSCI_ON);
 }
 
-int arm_set_cpu_on(uint64_t cpuid, uint64_t entry, uint64_t context_id,
-                   uint32_t target_el, bool target_aa64)
+int arm_set_cpu_on_with_endianness(uint64_t cpuid, uint64_t entry,
+                                   uint64_t context_id, uint32_t target_el,
+                                   bool target_aa64,
+                                   bool target_big_endian)
 {
     CPUState *target_cpu_state;
     ARMCPU *target_cpu;
@@ -96,6 +110,10 @@ int arm_set_cpu_on(uint64_t cpuid, uint64_t entry, uint64_t context_id,
 
     /* requested EL level need to be in the 1 to 3 range */
     assert((target_el > 0) && (target_el < 4));
+
+    if (target_big_endian && !target_aa64) {
+        return QEMU_ARM_POWERCTL_INVALID_PARAM;
+    }
 
     if (target_aa64 && (entry & 3)) {
         /*
@@ -134,15 +152,27 @@ int arm_set_cpu_on(uint64_t cpuid, uint64_t entry, uint64_t context_id,
     }
 
     if (!target_aa64 && arm_feature(&target_cpu->env, ARM_FEATURE_AARCH64)) {
-        /*
-         * For now we don't support booting an AArch64 CPU in AArch32 mode
-         * TODO: We should add this support later
-         */
-        qemu_log_mask(LOG_UNIMP,
-                      "[ARM]%s: Starting AArch64 CPU %" PRId64
-                      " in AArch32 mode is not supported yet\n",
-                      __func__, cpuid);
-        return QEMU_ARM_POWERCTL_INVALID_PARAM;
+        bool supports_aarch32;
+
+        switch (target_el) {
+        case 1:
+            supports_aarch32 =
+                cpu_isar_feature(aa64_aa32_el1, target_cpu);
+            break;
+        case 2:
+            supports_aarch32 =
+                cpu_isar_feature(aa64_aa32_el2, target_cpu);
+            break;
+        case 3:
+            supports_aarch32 =
+                cpu_isar_feature(aa64_aa32_el3, target_cpu);
+            break;
+        default:
+            g_assert_not_reached();
+        }
+        if (!supports_aarch32) {
+            return QEMU_ARM_POWERCTL_INVALID_PARAM;
+        }
     }
 
     /*
@@ -167,12 +197,20 @@ int arm_set_cpu_on(uint64_t cpuid, uint64_t entry, uint64_t context_id,
     info->context_id = context_id;
     info->target_el = target_el;
     info->target_aa64 = target_aa64;
+    info->target_big_endian = target_big_endian;
 
     async_run_on_cpu(target_cpu_state, arm_set_cpu_on_async_work,
                      RUN_ON_CPU_HOST_PTR(info));
 
     /* We are good to go */
     return QEMU_ARM_POWERCTL_RET_SUCCESS;
+}
+
+int arm_set_cpu_on(uint64_t cpuid, uint64_t entry, uint64_t context_id,
+                   uint32_t target_el, bool target_aa64)
+{
+    return arm_set_cpu_on_with_endianness(
+        cpuid, entry, context_id, target_el, target_aa64, false);
 }
 
 static void arm_set_cpu_on_and_reset_async_work(CPUState *target_cpu_state,

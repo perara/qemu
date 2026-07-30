@@ -50,6 +50,15 @@ int arm_set_cpu_on(uint64_t cpuid, uint64_t entry, uint64_t context_id,
                    uint32_t target_el, bool target_aa64);
 
 /*
+ * Like arm_set_cpu_on(), with an explicit AArch64 data-endianness state.
+ * @target_big_endian is valid only when @target_aa64 is true.
+ */
+int arm_set_cpu_on_with_endianness(uint64_t cpuid, uint64_t entry,
+                                   uint64_t context_id, uint32_t target_el,
+                                   bool target_aa64,
+                                   bool target_big_endian);
+
+/*
  * arm_set_cpu_off:
  * @cpuid: the id of the CPU we want to stop/shut down.
  *
