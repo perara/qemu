@@ -106,5 +106,20 @@ struct QCryptoTLSCredsX509Class {
     QCryptoTLSCredsClass parent_class;
 };
 
+/**
+ * qcrypto_tls_creds_x509_new_client_from_pem:
+ * @cacert: PEM-encoded CA certificate or certificate chain
+ * @cacertlen: length of @cacert
+ * @errp: pointer to a NULL-initialized error object
+ *
+ * Create peer-verifying client credentials from an in-memory trust anchor.
+ * The returned object is owned by the caller.
+ *
+ * Returns: new credentials, or NULL on error
+ */
+QCryptoTLSCreds *
+qcrypto_tls_creds_x509_new_client_from_pem(const uint8_t *cacert,
+                                           size_t cacertlen,
+                                           Error **errp);
 
 #endif /* QCRYPTO_TLSCREDSX509_H */

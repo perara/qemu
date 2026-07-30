@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/ctype.h"
 #include "qemu/error-report.h"
 #include "qemu/thread.h"
 #include "crypto/tlssession.h"
@@ -157,6 +158,97 @@ qcrypto_tls_session_pull(void *opaque, void *buf, size_t len)
     }
 }
 
+/*
+ * A label that parses as a C-style integer is an address component rather
+ * than a name: as well as the dotted quad there is shorthand ("127.1"),
+ * octal ("0177.0.0.1"), plain integer ("2130706433") and hexadecimal
+ * ("0x7f000001") -- and the hex forms contain letters, so "has a letter"
+ * is not a usable test.
+ */
+static bool qcrypto_tls_label_is_numeric(const char *label, size_t len)
+{
+    size_t i = 0;
+    bool hex = false;
+
+    if (len == 0) {
+        return false;
+    }
+    if (len > 2 && label[0] == '0' && (label[1] == 'x' || label[1] == 'X')) {
+        hex = true;
+        i = 2;
+    }
+    for (; i < len; i++) {
+        char c = label[i];
+
+        if (c >= '0' && c <= '9') {
+            continue;
+        }
+        if (hex && ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+/*
+ * RFC 6066 permits only a DNS name in the SNI extension, so an address
+ * must never be announced.  Rather than enumerating the spellings an
+ * address can take, require every part of the name to be plausible as a
+ * label and reject the name when all of its labels are numeric, which is
+ * what every IPv4 spelling reduces to.  IPv6 spellings, bracketed forms
+ * and zone ids are excluded by the character set.
+ *
+ * Character classification is done explicitly rather than with the ctype
+ * macros because those follow LC_CTYPE, and QEMU calls setlocale().
+ *
+ * On success @lenp receives the length to announce, which omits a
+ * trailing root label if the caller supplied an absolute name.
+ */
+static bool qcrypto_tls_hostname_is_sni_safe(const char *hostname,
+                                             size_t *lenp)
+{
+    size_t len = strlen(hostname);
+    const char *label = hostname;
+    bool numeric_only = true;
+    size_t i;
+
+    if (len > 0 && hostname[len - 1] == '.') {
+        len--; /* SNI carries no root label */
+    }
+    if (len == 0 || len > 253) {
+        return false;
+    }
+    for (i = 0; i <= len; i++) {
+        char c = i < len ? hostname[i] : '.';
+        size_t label_len;
+
+        if (c != '.') {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+                return false;
+            }
+            continue;
+        }
+        label_len = hostname + i - label;
+        if (label_len == 0 || label_len > 63) {
+            return false;
+        }
+        if (label[0] == '-' || label[label_len - 1] == '-') {
+            return false;
+        }
+        if (!qcrypto_tls_label_is_numeric(label, label_len)) {
+            numeric_only = false;
+        }
+        label = hostname + i + 1;
+    }
+    if (numeric_only) {
+        return false;
+    }
+    *lenp = len;
+    return true;
+}
+
 QCryptoTLSSession *
 qcrypto_tls_session_new(QCryptoTLSCreds *creds,
                         const char *hostname,
@@ -198,6 +290,25 @@ qcrypto_tls_session_new(QCryptoTLSCreds *creds,
         error_setg(errp, "Cannot initialize TLS session: %s",
                    gnutls_strerror(ret));
         goto error;
+    }
+    if (endpoint == QCRYPTO_TLS_CREDS_ENDPOINT_CLIENT && hostname) {
+        size_t sni_len;
+
+        /*
+         * Announce the requested name so that a server hosting several
+         * names can select the right certificate.  Failing to announce it
+         * is never fatal: the server simply keeps its default certificate,
+         * exactly as it did before SNI was offered at all, and the peer is
+         * still checked against @hostname either way.
+         */
+        if (qcrypto_tls_hostname_is_sni_safe(hostname, &sni_len)) {
+            ret = gnutls_server_name_set(session->handle, GNUTLS_NAME_DNS,
+                                         hostname, sni_len);
+            if (ret < 0) {
+                warn_report("Not announcing TLS server name '%s': %s",
+                            hostname, gnutls_strerror(ret));
+            }
+        }
     }
 
     prio = qcrypto_tls_creds_get_priority(creds);

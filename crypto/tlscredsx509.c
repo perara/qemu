@@ -902,6 +902,50 @@ qcrypto_tls_creds_x509_load(QCryptoTLSCredsX509 *creds,
     return 0;
 }
 
+QCryptoTLSCreds *
+qcrypto_tls_creds_x509_new_client_from_pem(const uint8_t *cacert,
+                                           size_t cacertlen,
+                                           Error **errp)
+{
+    QCryptoTLSCredsX509 *creds =
+        QCRYPTO_TLS_CREDS_X509(object_new(TYPE_QCRYPTO_TLS_CREDS_X509));
+    g_autoptr(QCryptoTLSCredsBox) box =
+        qcrypto_tls_creds_box_new_client(GNUTLS_CRD_CERTIFICATE);
+    gnutls_datum_t data = {
+        .data = (unsigned char *)cacert,
+        .size = cacertlen,
+    };
+    int ret;
+
+    /* gnutls_datum_t carries an unsigned int, so a larger length truncates. */
+    if (cacertlen > UINT_MAX) {
+        error_setg(errp, "CA certificate is too large");
+        object_unref(OBJECT(creds));
+        return NULL;
+    }
+
+    creds->parent_obj.endpoint = QCRYPTO_TLS_CREDS_ENDPOINT_CLIENT;
+    creds->parent_obj.verifyPeer = true;
+    ret = gnutls_certificate_allocate_credentials(&box->data.cert);
+    if (ret < 0) {
+        error_setg(errp, "Cannot allocate credentials: '%s'",
+                   gnutls_strerror(ret));
+        object_unref(OBJECT(creds));
+        return NULL;
+    }
+    ret = gnutls_certificate_set_x509_trust_mem(
+        box->data.cert, &data, GNUTLS_X509_FMT_PEM);
+    if (ret <= 0) {
+        error_setg(errp, "Cannot load in-memory CA certificate: %s",
+                   ret < 0 ? gnutls_strerror(ret) :
+                             "no certificates found");
+        object_unref(OBJECT(creds));
+        return NULL;
+    }
+    creds->parent_obj.box = g_steal_pointer(&box);
+    return &creds->parent_obj;
+}
+
 
 #else /* ! CONFIG_GNUTLS */
 
@@ -911,6 +955,16 @@ qcrypto_tls_creds_x509_load(QCryptoTLSCredsX509 *creds G_GNUC_UNUSED,
                             Error **errp)
 {
     error_setg(errp, "TLS credentials support requires GNUTLS");
+}
+
+QCryptoTLSCreds *
+qcrypto_tls_creds_x509_new_client_from_pem(
+    const uint8_t *cacert G_GNUC_UNUSED,
+    size_t cacertlen G_GNUC_UNUSED,
+    Error **errp)
+{
+    error_setg(errp, "TLS credentials support requires GNUTLS");
+    return NULL;
 }
 
 

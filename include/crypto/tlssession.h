@@ -115,13 +115,19 @@ typedef struct QCryptoTLSSession QCryptoTLSSession;
 /**
  * qcrypto_tls_session_new:
  * @creds: pointer to a TLS credentials object
- * @hostname: optional hostname to validate
+ * @hostname: optional hostname to validate, and to announce via SNI
  * @aclname: optional ACL to validate peer credentials against
  * @endpoint: role of the TLS session, client or server
  * @errp: pointer to a NULL-initialized error object
  *
  * Create a new TLS session object that will be used to
  * negotiate a TLS session over an arbitrary data channel.
+ *
+ * For a client session, @hostname is both matched against the peer's
+ * certificate and, when it is a DNS name, sent to the server in the
+ * Server Name Indication extension so that a server hosting several
+ * names can pick the right certificate.  An address is never sent: RFC
+ * 6066 permits only a DNS name there.
  * The session object can operate as either the server or
  * client, according to the value of the @endpoint argument.
  *
