@@ -3,6 +3,7 @@ slow_qtests = {
   'aspeed_smc-test': 360,
   'bios-tables-test' : 910,
   'cdrom-test' : 610,
+  'raspi4-boot-test': 360,
   'device-introspect-test' : 720,
   'ide-test' : 120,
   'migration-test' : 480,
@@ -266,7 +267,7 @@ qtests_aarch64 = \
     ['tpm-tis-device-test', 'tpm-tis-device-swtpm-test'] : []) +                                         \
   (config_all_devices.has_key('CONFIG_XLNX_ZYNQMP_ARM') ? ['xlnx-can-test', 'fuzz-xlnx-dp-test'] : []) + \
   (config_all_devices.has_key('CONFIG_XLNX_VERSAL') ? ['xlnx-canfd-test', 'xlnx-versal-trng-test'] : []) + \
-  (config_all_devices.has_key('CONFIG_RASPI') ? ['bcm2835-dma-test', 'bcm2835-i2c-test'] : []) +  \
+  (config_all_devices.has_key('CONFIG_RASPI') ? ['bcm2835-dma-test', 'bcm2835-i2c-test', 'raspi4-boot-test'] : []) +  \
   (config_all_accel.has_key('CONFIG_TCG') and                                            \
    config_all_devices.has_key('CONFIG_TPM_TIS_I2C') ? ['tpm-tis-i2c-test', 'tpm-tis-i2c-swtpm-test'] : []) + \
   (config_all_devices.has_key('CONFIG_ASPEED_SOC') ? qtests_aspeed64 : []) + \
@@ -402,6 +403,13 @@ qtests = {
   'ivshmem-test': [rt, '../../contrib/ivshmem-server/ivshmem-server.c'],
   'migration-test': test_migration_files + migration_tls_files + migration_colo_files,
   'pxe-test': files('boot-sector.c'),
+  'raspi4-boot-test': [fdt, files('raspi4-peripheral-test.c',
+                                  'raspi4-platform-test.c',
+                                  'raspi4-test-common.c',
+                                  'raspi4-boot-media-test.c',
+                                  'raspi4-storage-usb-test.c')] +
+    (tasn1.found() ?
+    [files('../unit/crypto-tls-x509-helpers.c'), tasn1] : []),
   'pnv-xive2-test': files('pnv-xive2-common.c', 'pnv-xive2-flush-sync.c',
                           'pnv-xive2-nvpg_bar.c'),
   'qos-test': [chardev, io, qos_test_ss.apply({}).sources()],
