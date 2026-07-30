@@ -11,12 +11,17 @@
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
+
+/* Control blocks followed in a single synchronous dispatch */
+#define BCM2835_DMA_MAX_CB_PER_DISPATCH 4096
 
 /* DMA CS Control and Status bits */
 #define BCM2708_DMA_ACTIVE      (1 << 0)
 #define BCM2708_DMA_END         (1 << 1) /* GE */
 #define BCM2708_DMA_INT         (1 << 2)
+#define BCM2708_DMA_CS_DREQ     (1 << 3)
 #define BCM2708_DMA_ISPAUSED    (1 << 4)  /* Pause requested or not active */
 #define BCM2708_DMA_ISHELD      (1 << 5)  /* Is held by DREQ flow control */
 #define BCM2708_DMA_ERR         (1 << 8)
@@ -35,6 +40,8 @@
 #define BCM2708_DMA_S_WIDTH     (1 << 9)
 #define BCM2708_DMA_S_DREQ      (1 << 10)
 #define BCM2708_DMA_S_IGNORE    (1 << 11)
+#define BCM2708_DMA_PER_MAP_SHIFT 16
+#define BCM2708_DMA_PER_MAP_MASK  0x1f
 
 /* Register offsets */
 #define BCM2708_DMA_CS          0x00 /* Control and Status */
@@ -52,60 +59,125 @@
 #define BCM2708_DMA_ENABLE      0xff0 /* Global enable bits for each channel */
 
 #define BCM2708_DMA_CS_RW_MASK  0x30ff0001 /* All RW bits in DMA_CS */
+#define BCM2708_DMA_PRIORITY_SHIFT 16
+#define BCM2708_DMA_PANIC_PRIORITY_SHIFT 20
+
+static bool bcm2835_dma_uses_dreq(const BCM2835DMAChan *ch)
+{
+    return ch->ti & (BCM2708_DMA_D_DREQ | BCM2708_DMA_S_DREQ);
+}
+
+static unsigned bcm2835_dma_permap(const BCM2835DMAChan *ch)
+{
+    return (ch->ti >> BCM2708_DMA_PER_MAP_SHIFT) &
+           BCM2708_DMA_PER_MAP_MASK;
+}
+
+static bool bcm2835_dma_load_cb(BCM2835DMAState *s, unsigned c)
+{
+    BCM2835DMAChan *ch = &s->chan[c];
+
+    ch->ti = ldl_le_phys(&s->dma_as, ch->conblk_ad);
+    ch->source_ad = ldl_le_phys(&s->dma_as, ch->conblk_ad + 4);
+    ch->dest_ad = ldl_le_phys(&s->dma_as, ch->conblk_ad + 8);
+    ch->txfr_len = ldl_le_phys(&s->dma_as, ch->conblk_ad + 12);
+    ch->stride = ldl_le_phys(&s->dma_as, ch->conblk_ad + 16);
+    ch->nextconbk = ldl_le_phys(&s->dma_as, ch->conblk_ad + 20);
+
+    ch->ylen = 1;
+    if (ch->ti & BCM2708_DMA_TDMODE) {
+        ch->ylen += (ch->txfr_len >> 16) & 0x3fff;
+        ch->xlen_td = ch->txfr_len & 0xffff;
+    } else {
+        ch->xlen_td = ch->txfr_len;
+    }
+
+    if (ch->ti & BCM2708_DMA_D_WIDTH) {
+        qemu_log_mask(LOG_UNIMP,
+                      "%s: 128bit transfers not yet supported\n", __func__);
+        ch->cs |= BCM2708_DMA_ERR;
+        return false;
+    }
+
+    /*
+     * Datasheet implies 32bit or 128bit transfers only.
+     *
+     * TODO: test on real HW and report back.
+     */
+    if (ch->xlen_td & 0x3) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad transfer size\n", __func__);
+        ch->cs |= BCM2708_DMA_ERR;
+        return false;
+    }
+
+    ch->cb_loaded = true;
+    return true;
+}
+
+static bool bcm2835_dma_dreq_ready(BCM2835DMAState *s,
+                                   BCM2835DMAChan *ch)
+{
+    return !bcm2835_dma_uses_dreq(ch) ||
+           s->dreq[bcm2835_dma_permap(ch)];
+}
+
+static unsigned bcm2835_dma_effective_priority(BCM2835DMAState *s,
+                                               BCM2835DMAChan *ch)
+{
+    unsigned shift = BCM2708_DMA_PRIORITY_SHIFT;
+
+    if (bcm2835_dma_uses_dreq(ch) &&
+        s->panic[bcm2835_dma_permap(ch)]) {
+        shift = BCM2708_DMA_PANIC_PRIORITY_SHIFT;
+    }
+    return extract32(ch->cs, shift, 4);
+}
 
 static void bcm2835_dma_update(BCM2835DMAState *s, unsigned c)
 {
     BCM2835DMAChan *ch = &s->chan[c];
-    uint32_t data, xlen, xlen_td, ylen;
-    int16_t dst_stride, src_stride;
+    unsigned int control_blocks = 0;
+    uint32_t data;
 
-    if (!(s->enable & (1 << c))) {
+    if (!(s->enable & (1 << c)) || !(ch->cs & BCM2708_DMA_ACTIVE)) {
         return;
     }
 
-    while ((s->enable & (1 << c)) && (ch->conblk_ad != 0)) {
-        /* CB fetch */
-        ch->ti = ldl_le_phys(&s->dma_as, ch->conblk_ad);
-        ch->source_ad = ldl_le_phys(&s->dma_as, ch->conblk_ad + 4);
-        ch->dest_ad = ldl_le_phys(&s->dma_as, ch->conblk_ad + 8);
-        ch->txfr_len = ldl_le_phys(&s->dma_as, ch->conblk_ad + 12);
-        ch->stride = ldl_le_phys(&s->dma_as, ch->conblk_ad + 16);
-        ch->nextconbk = ldl_le_phys(&s->dma_as, ch->conblk_ad + 20);
+    ch->cs &= ~(BCM2708_DMA_ISPAUSED | BCM2708_DMA_ISHELD);
 
-        ylen = 1;
-        if (ch->ti & BCM2708_DMA_TDMODE) {
-            /* 2D transfer mode */
-            ylen += (ch->txfr_len >> 16) & 0x3fff;
-            xlen = ch->txfr_len & 0xffff;
-            dst_stride = ch->stride >> 16;
-            src_stride = ch->stride & 0xffff;
-        } else {
-            xlen = ch->txfr_len;
-            dst_stride = 0;
-            src_stride = 0;
-        }
-        xlen_td = xlen;
-
-        if (ch->ti & BCM2708_DMA_D_WIDTH) {
-            qemu_log_mask(LOG_UNIMP, "%s: 128bit transfers not yet supported", __func__);
-            ch->cs |= BCM2708_DMA_ERR;
-            break;
-        }
+    while ((s->enable & (1 << c)) && (ch->cs & BCM2708_DMA_ACTIVE) &&
+           ch->conblk_ad != 0) {
+        uint32_t xlen;
 
         /*
-         * Datasheet implies 32bit or 128bit transfers only
-         *
-         * TODO: test on real HW and report back.
+         * A control block that points back at itself would keep this
+         * synchronous loop running forever.  Bound the chain per dispatch
+         * and leave the channel active so a legitimate long chain simply
+         * continues on the next one.
          */
-        if (xlen & 0x3) {
-            qemu_log_mask(LOG_GUEST_ERROR, "%s: bad transfer size\n", __func__);
-            ch->cs |= BCM2708_DMA_ERR;
+        if (control_blocks++ >= BCM2835_DMA_MAX_CB_PER_DISPATCH) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: channel %u exceeded its control-block budget\n",
+                          __func__, c);
+            ch->cs |= BCM2708_DMA_ISHELD;
+            return;
+        }
+
+        if (!ch->cb_loaded && !bcm2835_dma_load_cb(s, c)) {
             break;
         }
 
-        while (ylen != 0) {
+        xlen = ch->ti & BCM2708_DMA_TDMODE ?
+               ch->txfr_len & 0xffff : ch->txfr_len;
+
+        while (ch->ylen != 0) {
             /* Normal transfer mode */
             while (xlen != 0) {
+                if (!bcm2835_dma_dreq_ready(s, ch)) {
+                    ch->cs |= BCM2708_DMA_ISHELD;
+                    return;
+                }
+
                 if (ch->ti & BCM2708_DMA_S_IGNORE) {
                     /* Ignore reads */
                     data = 0;
@@ -128,18 +200,22 @@ static void bcm2835_dma_update(BCM2835DMAState *s, unsigned c)
                 /* update remaining transfer length */
                 xlen -= 4;
                 if (ch->ti & BCM2708_DMA_TDMODE) {
-                    ch->txfr_len = (ylen << 16) | xlen;
+                    ch->txfr_len = (ch->ylen << 16) | xlen;
                 } else {
                     ch->txfr_len = xlen;
                 }
             }
 
-            if (--ylen != 0) {
-                ch->source_ad += src_stride;
-                ch->dest_ad += dst_stride;
-                xlen = xlen_td;
+            if (--ch->ylen != 0) {
+                ch->source_ad += (int16_t)(ch->stride & 0xffff);
+                ch->dest_ad += (int16_t)(ch->stride >> 16);
+                xlen = ch->xlen_td;
+                ch->txfr_len = (ch->ylen << 16) | xlen;
+            } else {
+                ch->txfr_len = 0;
             }
         }
+
         ch->cs |= BCM2708_DMA_END;
         if (ch->ti & BCM2708_DMA_INT_EN) {
             ch->cs |= BCM2708_DMA_INT;
@@ -149,16 +225,90 @@ static void bcm2835_dma_update(BCM2835DMAState *s, unsigned c)
 
         /* Process next CB */
         ch->conblk_ad = ch->nextconbk;
+        ch->cb_loaded = false;
     }
 
     ch->cs &= ~BCM2708_DMA_ACTIVE;
     ch->cs |= BCM2708_DMA_ISPAUSED;
 }
 
+static void bcm2835_dma_dreq_bh(void *opaque)
+{
+    BCM2835DMAState *s = opaque;
+    uint16_t pending = 0;
+    int c;
+
+    for (c = 0; c < BCM2835_DMA_NCHANS; c++) {
+        BCM2835DMAChan *ch = &s->chan[c];
+
+        if ((ch->cs & BCM2708_DMA_ACTIVE) && ch->cb_loaded &&
+            bcm2835_dma_uses_dreq(ch) &&
+            s->dreq[bcm2835_dma_permap(ch)]) {
+            pending |= BIT(c);
+        }
+    }
+
+    while (pending) {
+        int selected = -1;
+        unsigned selected_priority = 0;
+
+        for (c = 0; c < BCM2835_DMA_NCHANS; c++) {
+            unsigned priority;
+
+            if (!(pending & BIT(c))) {
+                continue;
+            }
+            priority = bcm2835_dma_effective_priority(s, &s->chan[c]);
+            if (selected < 0 || priority > selected_priority) {
+                selected = c;
+                selected_priority = priority;
+            }
+        }
+        pending &= ~BIT(selected);
+        bcm2835_dma_update(s, selected);
+    }
+}
+
+static void bcm2835_dma_set_dreq(void *opaque, int n, int level)
+{
+    BCM2835DMAState *s = opaque;
+    bool old_level;
+
+    assert(n >= 0 && n < ARRAY_SIZE(s->dreq));
+    old_level = s->dreq[n];
+    s->dreq[n] = level;
+    if (level && !old_level) {
+        qemu_bh_schedule(s->dreq_bh);
+    }
+}
+
+static void bcm2835_dma_set_panic(void *opaque, int n, int level)
+{
+    BCM2835DMAState *s = opaque;
+    bool old_level;
+
+    assert(n >= 0 && n < ARRAY_SIZE(s->panic));
+    old_level = s->panic[n];
+    s->panic[n] = level;
+    if (old_level != s->panic[n] && s->dreq[n]) {
+        qemu_bh_schedule(s->dreq_bh);
+    }
+}
+
 static void bcm2835_dma_chan_reset(BCM2835DMAChan *ch)
 {
     ch->cs = 0;
     ch->conblk_ad = 0;
+    ch->ti = 0;
+    ch->source_ad = 0;
+    ch->dest_ad = 0;
+    ch->txfr_len = 0;
+    ch->stride = 0;
+    ch->nextconbk = 0;
+    ch->debug = 0;
+    ch->xlen_td = 0;
+    ch->ylen = 0;
+    ch->cb_loaded = false;
 }
 
 static uint64_t bcm2835_dma_read(BCM2835DMAState *s, hwaddr offset,
@@ -175,6 +325,11 @@ static uint64_t bcm2835_dma_read(BCM2835DMAState *s, hwaddr offset,
     switch (offset) {
     case BCM2708_DMA_CS:
         res = ch->cs;
+        if (ch->cb_loaded &&
+            (!bcm2835_dma_uses_dreq(ch) ||
+             s->dreq[bcm2835_dma_permap(ch)])) {
+            res |= BCM2708_DMA_CS_DREQ;
+        }
         break;
     case BCM2708_DMA_ADDR:
         res = ch->conblk_ad;
@@ -240,10 +395,14 @@ static void bcm2835_dma_write(BCM2835DMAState *s, hwaddr offset,
         ch->cs |= (value & BCM2708_DMA_CS_RW_MASK);
         if (!(oldcs & BCM2708_DMA_ACTIVE) && (ch->cs & BCM2708_DMA_ACTIVE)) {
             bcm2835_dma_update(s, c);
+        } else if ((oldcs & BCM2708_DMA_ACTIVE) &&
+                   !(ch->cs & BCM2708_DMA_ACTIVE)) {
+            ch->cs &= ~BCM2708_DMA_ISHELD;
         }
         break;
     case BCM2708_DMA_ADDR:
         ch->conblk_ad = value;
+        ch->cb_loaded = false;
         break;
     case BCM2708_DMA_DEBUG:
         ch->debug = value;
@@ -292,8 +451,19 @@ static void bcm2835_dma0_write(void *opaque, hwaddr offset, uint64_t value,
         case BCM2708_DMA_INT_STATUS:
             break;
         case BCM2708_DMA_ENABLE:
+        {
+            uint32_t old_enable = s->enable;
+
             s->enable = (value & 0xffff);
+            for (unsigned c = 0; c < BCM2835_DMA_NCHANS; c++) {
+                if (!(old_enable & (1 << c)) &&
+                    (s->enable & (1 << c)) &&
+                    (s->chan[c].cs & BCM2708_DMA_ACTIVE)) {
+                    bcm2835_dma_update(s, c);
+                }
+            }
             break;
+        }
         default:
             qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad offset 0x%"HWADDR_PRIx"\n",
                           __func__, offset);
@@ -326,7 +496,7 @@ static const MemoryRegionOps bcm2835_dma15_ops = {
 
 static const VMStateDescription vmstate_bcm2835_dma_chan = {
     .name = TYPE_BCM2835_DMA "-chan",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(cs, BCM2835DMAChan),
@@ -338,19 +508,54 @@ static const VMStateDescription vmstate_bcm2835_dma_chan = {
         VMSTATE_UINT32(stride, BCM2835DMAChan),
         VMSTATE_UINT32(nextconbk, BCM2835DMAChan),
         VMSTATE_UINT32(debug, BCM2835DMAChan),
+        VMSTATE_UINT32_V(xlen_td, BCM2835DMAChan, 2),
+        VMSTATE_UINT32_V(ylen, BCM2835DMAChan, 2),
+        VMSTATE_BOOL_V(cb_loaded, BCM2835DMAChan, 2),
         VMSTATE_END_OF_LIST()
     }
 };
 
+static int bcm2835_dma_post_load(void *opaque, int version_id)
+{
+    BCM2835DMAState *s = opaque;
+    bool resume = false;
+    int c;
+
+    if (version_id < 3) {
+        memset(s->panic, 0, sizeof(s->panic));
+    }
+    for (c = 0; c < BCM2835_DMA_NCHANS; c++) {
+        BCM2835DMAChan *ch = &s->chan[c];
+
+        qemu_set_irq(ch->irq, ch->cs & BCM2708_DMA_INT);
+        if (ch->cb_loaded &&
+            (!(ch->cs & BCM2708_DMA_ACTIVE) || ch->conblk_ad == 0 ||
+             ch->ylen == 0 || ch->xlen_td == 0 ||
+             (ch->xlen_td & 3))) {
+            return -EINVAL;
+        }
+        resume |= ch->cb_loaded && bcm2835_dma_uses_dreq(ch) &&
+                  s->dreq[bcm2835_dma_permap(ch)];
+    }
+    if (resume) {
+        qemu_bh_schedule(s->dreq_bh);
+    }
+
+    return 0;
+}
+
 static const VMStateDescription vmstate_bcm2835_dma = {
     .name = TYPE_BCM2835_DMA,
-    .version_id = 1,
+    .version_id = 3,
     .minimum_version_id = 1,
+    .post_load = bcm2835_dma_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(chan, BCM2835DMAState, BCM2835_DMA_NCHANS, 1,
                              vmstate_bcm2835_dma_chan, BCM2835DMAChan),
         VMSTATE_UINT32(int_status, BCM2835DMAState),
         VMSTATE_UINT32(enable, BCM2835DMAState),
+        VMSTATE_BOOL_ARRAY_V(dreq, BCM2835DMAState, 32, 2),
+        VMSTATE_BOOL_ARRAY_V(panic, BCM2835DMAState, 32, 3),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -376,6 +581,17 @@ static void bcm2835_dma_init(Object *obj)
     for (n = 0; n < 16; n++) {
         sysbus_init_irq(SYS_BUS_DEVICE(s), &s->chan[n].irq);
     }
+    qdev_init_gpio_in_named(DEVICE(obj), bcm2835_dma_set_dreq, "dreq", 32);
+    qdev_init_gpio_in_named(DEVICE(obj), bcm2835_dma_set_panic, "panic", 32);
+    s->dreq_bh = qemu_bh_new_guarded(
+        bcm2835_dma_dreq_bh, s, &DEVICE(obj)->mem_reentrancy_guard);
+}
+
+static void bcm2835_dma_finalize(Object *obj)
+{
+    BCM2835DMAState *s = BCM2835_DMA(obj);
+
+    qemu_bh_delete(s->dreq_bh);
 }
 
 static void bcm2835_dma_reset(DeviceState *dev)
@@ -385,7 +601,11 @@ static void bcm2835_dma_reset(DeviceState *dev)
 
     s->enable = 0xffff;
     s->int_status = 0;
+    qemu_bh_cancel(s->dreq_bh);
+    memset(s->dreq, 0, sizeof(s->dreq));
+    memset(s->panic, 0, sizeof(s->panic));
     for (n = 0; n < BCM2835_DMA_NCHANS; n++) {
+        qemu_set_irq(s->chan[n].irq, 0);
         bcm2835_dma_chan_reset(&s->chan[n]);
     }
 }
@@ -417,6 +637,7 @@ static const TypeInfo bcm2835_dma_info = {
     .instance_size = sizeof(BCM2835DMAState),
     .class_init    = bcm2835_dma_class_init,
     .instance_init = bcm2835_dma_init,
+    .instance_finalize = bcm2835_dma_finalize,
 };
 
 static void bcm2835_dma_register_types(void)

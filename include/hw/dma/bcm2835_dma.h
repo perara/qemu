@@ -21,6 +21,9 @@ typedef struct {
     uint32_t stride;
     uint32_t nextconbk;
     uint32_t debug;
+    uint32_t xlen_td;
+    uint32_t ylen;
+    bool cb_loaded;
 
     qemu_irq irq;
 } BCM2835DMAChan;
@@ -29,6 +32,11 @@ typedef struct {
 OBJECT_DECLARE_SIMPLE_TYPE(BCM2835DMAState, BCM2835_DMA)
 
 #define BCM2835_DMA_NCHANS 16
+#define BCM2711_DMA_DREQ_PWM1 1
+#define BCM2835_DMA_DREQ_PWM 5
+#define BCM2835_DMA_DREQ_SPI_TX 6
+#define BCM2835_DMA_DREQ_SPI_RX 7
+#define BCM2835_DMA_DREQ_EMMC 11
 
 struct BCM2835DMAState {
     /*< private >*/
@@ -42,6 +50,9 @@ struct BCM2835DMAState {
     BCM2835DMAChan chan[BCM2835_DMA_NCHANS];
     uint32_t int_status;
     uint32_t enable;
+    bool dreq[32];
+    bool panic[32];
+    QEMUBH *dreq_bh;
 };
 
 #endif

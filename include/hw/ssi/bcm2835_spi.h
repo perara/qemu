@@ -23,9 +23,12 @@
  */
 
 #include "hw/core/sysbus.h"
+#include "hw/core/clock.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/ssi/ssi.h"
 #include "qom/object.h"
 #include "qemu/fifo8.h"
+#include "qemu/timer.h"
 
 #define TYPE_BCM2835_SPI "bcm2835-spi"
 OBJECT_DECLARE_SIMPLE_TYPE(BCM2835SPIState, BCM2835_SPI)
@@ -54,12 +57,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2835SPIState, BCM2835_SPI)
 #define BCM2835_SPI_CS_DONE     BIT(16)
 #define BCM2835_SPI_CS_LEN      BIT(13)
 #define BCM2835_SPI_CS_REN      BIT(12)
+#define BCM2835_SPI_CS_ADCS     BIT(11)
 #define BCM2835_SPI_CS_INTR     BIT(10)
 #define BCM2835_SPI_CS_INTD     BIT(9)
 #define BCM2835_SPI_CS_DMAEN    BIT(8)
 #define BCM2835_SPI_CS_TA       BIT(7)
+#define BCM2835_SPI_CS_CSPOL    BIT(6)
 #define BCM2835_SPI_CLEAR_RX    BIT(5)
 #define BCM2835_SPI_CLEAR_TX    BIT(4)
+#define BCM2835_SPI_CS_CPHA     BIT(2)
+#define BCM2835_SPI_CS_CPOL     BIT(3)
+#define BCM2835_SPI_CS_SELECT_MASK 0x3
+#define BCM2835_SPI_CS_CSPOL0   BIT(21)
+#define BCM2835_SPI_CS_CSPOL1   BIT(22)
+#define BCM2835_SPI_CS_CSPOL2   BIT(23)
+
+#define BCM2835_SPI_DMA_TX_DREQ 0
+#define BCM2835_SPI_DMA_RX_DREQ 1
+#define BCM2835_SPI_DMA_TX_PANIC 2
+#define BCM2835_SPI_DMA_RX_PANIC 3
+#define BCM2835_SPI_DMA_OUTPUTS 4
 
 struct BCM2835SPIState {
     /* <private> */
@@ -69,12 +86,19 @@ struct BCM2835SPIState {
     SSIBus *bus;
     MemoryRegion iomem;
     qemu_irq irq;
+    qemu_irq chip_select[3];
+    qemu_irq dma_threshold[BCM2835_SPI_DMA_OUTPUTS];
+    Clock *core_clk;
+    QEMUTimer *transfer_timer;
 
     uint32_t cs;
     uint32_t clk;
     uint32_t dlen;
     uint32_t ltoh;
     uint32_t dc;
+    uint32_t dma_remaining;
+    uint8_t transfer_remaining_cycles;
+    bool dma_complete;
 
     Fifo8 tx_fifo;
     Fifo8 rx_fifo;
