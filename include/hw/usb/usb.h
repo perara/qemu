@@ -143,6 +143,7 @@
 
 #define USB_DEVICE_SELF_POWERED         0
 #define USB_DEVICE_REMOTE_WAKEUP        1
+#define USB_ENDPOINT_HALT               0
 
 #define USB_DT_DEVICE                   0x01
 #define USB_DT_CONFIG                   0x02

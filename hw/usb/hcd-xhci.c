@@ -20,6 +20,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -2716,6 +2717,7 @@ static void xhci_reset(DeviceState *dev)
     xhci->dcbaap_low = 0;
     xhci->dcbaap_high = 0;
     xhci->config = 0;
+    g_clear_pointer(&xhci->firmware_host, g_free);
 
     for (i = 0; i < xhci->numslots; i++) {
         xhci_disable_slot(xhci, i+1);
@@ -3294,6 +3296,805 @@ static void xhci_complete(USBPort *port, USBPacket *packet)
     }
 }
 
+unsigned int xhci_host_firmware_port_count(XHCIState *xhci)
+{
+    return MAX(xhci->numports_2, xhci->numports_3);
+}
+
+/*
+ * The Pi 4 EEPROM drives the VL805 before ARM execution starts.  Model that
+ * firmware-owned xHCI driver with real guest-DMA data structures instead of
+ * bypassing the controller through direct USBPacket submission.
+ */
+#define XHCI_FW_MAX_SLOTS       16
+#define XHCI_FW_RING_TRBS       256
+#define XHCI_FW_EVENT_TRBS      256
+#define XHCI_FW_DMA_SIZE        0x80000
+#define XHCI_FW_DCBAA           0x00000
+#define XHCI_FW_COMMAND_RING    0x01000
+#define XHCI_FW_ERST            0x02000
+#define XHCI_FW_EVENT_RING      0x03000
+#define XHCI_FW_OUTPUT_CONTEXT  0x04000
+#define XHCI_FW_INPUT_CONTEXT   0x14000
+#define XHCI_FW_TRANSFER_RING   0x24000
+#define XHCI_FW_TRANSFER_STRIDE 0x1000
+#define XHCI_FW_DATA            0x60000
+#define XHCI_FW_DATA_SIZE       0x10000
+
+typedef struct XHCIFirmwareRing {
+    uint16_t enqueue;
+    bool cycle;
+} XHCIFirmwareRing;
+
+struct XHCIFirmwareHost {
+    dma_addr_t dma;
+    uint16_t command_enqueue;
+    bool command_cycle;
+    uint16_t event_dequeue;
+    bool event_cycle;
+    uint8_t address[XHCI_FW_MAX_SLOTS + 1];
+    XHCIFirmwareRing endpoint[XHCI_FW_MAX_SLOTS + 1][32];
+    bool endpoint_configured[XHCI_FW_MAX_SLOTS + 1][32];
+    bool control_pending;
+    bool control_status_pending;
+    uint8_t control_slot;
+    uint8_t setup[8];
+    bool initialized;
+};
+
+static dma_addr_t xhci_fw_addr(XHCIFirmwareHost *fw, dma_addr_t offset)
+{
+    return fw->dma + offset;
+}
+
+static dma_addr_t xhci_fw_output_context(XHCIFirmwareHost *fw,
+                                         unsigned int slot)
+{
+    return xhci_fw_addr(fw, XHCI_FW_OUTPUT_CONTEXT + slot * 0x400);
+}
+
+static dma_addr_t xhci_fw_input_context(XHCIFirmwareHost *fw,
+                                        unsigned int slot)
+{
+    return xhci_fw_addr(fw, XHCI_FW_INPUT_CONTEXT + slot * 0x400);
+}
+
+static dma_addr_t xhci_fw_transfer_ring(XHCIFirmwareHost *fw,
+                                        unsigned int slot,
+                                        unsigned int epid)
+{
+    unsigned int ring = slot * 3;
+
+    if (epid == 3) {
+        ring++;
+    } else if (epid == 4) {
+        ring += 2;
+    }
+    return xhci_fw_addr(fw, XHCI_FW_TRANSFER_RING +
+                       ring * XHCI_FW_TRANSFER_STRIDE);
+}
+
+static bool xhci_fw_dma_write(XHCIState *xhci, dma_addr_t address,
+                              const void *data, size_t length, Error **errp)
+{
+    if (dma_memory_write(xhci->as, address, data, length,
+                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        error_setg(errp, "xHCI firmware DMA write failed at 0x%" HWADDR_PRIx,
+                   address);
+        return false;
+    }
+    return true;
+}
+
+static bool xhci_fw_dma_read(XHCIState *xhci, dma_addr_t address,
+                             void *data, size_t length, Error **errp)
+{
+    if (dma_memory_read(xhci->as, address, data, length,
+                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        error_setg(errp, "xHCI firmware DMA read failed at 0x%" HWADDR_PRIx,
+                   address);
+        return false;
+    }
+    return true;
+}
+
+static bool xhci_fw_write_trb(XHCIState *xhci, dma_addr_t address,
+                              uint64_t parameter, uint32_t status,
+                              uint32_t control, Error **errp)
+{
+    uint8_t trb[TRB_SIZE];
+
+    stq_le_p(trb, parameter);
+    stl_le_p(trb + 8, status);
+    stl_le_p(trb + 12, control);
+    return xhci_fw_dma_write(xhci, address, trb, sizeof(trb), errp);
+}
+
+static bool xhci_fw_next_event(XHCIState *xhci, TRBType wanted,
+                               uint8_t wanted_slot, uint64_t wanted_ptr,
+                               uint32_t *residual, uint8_t *event_slot,
+                               Error **errp)
+{
+    XHCIFirmwareHost *fw = xhci->firmware_host;
+    uint8_t trb[TRB_SIZE];
+
+    for (unsigned int attempt = 0; attempt < 10000; attempt++) {
+        uint32_t status;
+        uint32_t control;
+        uint64_t ptr;
+        uint8_t slot;
+        TRBType type;
+        TRBCCode ccode;
+
+        if (!xhci_fw_dma_read(
+                xhci, xhci_fw_addr(fw, XHCI_FW_EVENT_RING) +
+                      fw->event_dequeue * TRB_SIZE,
+                trb, sizeof(trb), errp)) {
+            return false;
+        }
+        control = ldl_le_p(trb + 12);
+        if (!!(control & TRB_C) != fw->event_cycle) {
+            aio_poll(qemu_get_aio_context(), false);
+            g_usleep(100);
+            continue;
+        }
+        status = ldl_le_p(trb + 8);
+        type = (control >> TRB_TYPE_SHIFT) & TRB_TYPE_MASK;
+        ccode = status >> 24;
+        slot = control >> 24;
+        ptr = ldq_le_p(trb);
+        fw->event_dequeue++;
+        if (fw->event_dequeue == XHCI_FW_EVENT_TRBS) {
+            fw->event_dequeue = 0;
+            fw->event_cycle = !fw->event_cycle;
+        }
+        xhci_runtime_write(
+            xhci, 0x38,
+            (xhci_fw_addr(fw, XHCI_FW_EVENT_RING) +
+             fw->event_dequeue * TRB_SIZE) | ERDP_EHB, 4);
+
+        if (type != wanted || (wanted_slot && slot != wanted_slot) ||
+            (wanted_ptr && ptr != wanted_ptr)) {
+            continue;
+        }
+        if (ccode != CC_SUCCESS && ccode != CC_SHORT_PACKET) {
+            error_setg(errp,
+                       "xHCI firmware %s event failed (completion code %u)",
+                       wanted == ER_COMMAND_COMPLETE ? "command" : "transfer",
+                       ccode);
+            return false;
+        }
+        if (residual) {
+            *residual = status & 0xffffff;
+        }
+        if (event_slot) {
+            *event_slot = slot;
+        }
+        return true;
+    }
+    error_setg(errp, "xHCI firmware event type %u for slot %u timed out",
+               wanted, wanted_slot);
+    return false;
+}
+
+static bool xhci_fw_command(XHCIState *xhci, TRBType type,
+                            uint64_t parameter, uint8_t slot,
+                            uint8_t epid, bool bsr, uint8_t *event_slot,
+                            Error **errp)
+{
+    XHCIFirmwareHost *fw = xhci->firmware_host;
+    uint32_t control = fw->command_cycle |
+                       (type << TRB_TYPE_SHIFT) |
+                       (slot << TRB_CR_SLOTID_SHIFT) |
+                       (epid << TRB_CR_EPID_SHIFT);
+    dma_addr_t address;
+
+    if (fw->command_enqueue >= XHCI_FW_RING_TRBS - 1) {
+        error_setg(errp, "xHCI firmware command ring is exhausted");
+        return false;
+    }
+    if (bsr) {
+        control |= TRB_CR_BSR;
+    }
+    address = xhci_fw_addr(fw, XHCI_FW_COMMAND_RING) +
+              fw->command_enqueue * TRB_SIZE;
+    if (!xhci_fw_write_trb(
+            xhci, address, parameter, 0, control, errp)) {
+        return false;
+    }
+    fw->command_enqueue++;
+    xhci_doorbell_write(xhci, 0, 0, 4);
+    return xhci_fw_next_event(
+        xhci, ER_COMMAND_COMPLETE, slot, address, NULL, event_slot, errp);
+}
+
+static bool xhci_fw_ring_put(XHCIState *xhci, unsigned int slot,
+                             unsigned int epid, uint64_t parameter,
+                             uint32_t status, uint32_t control,
+                             dma_addr_t *trb_address, Error **errp)
+{
+    XHCIFirmwareHost *fw = xhci->firmware_host;
+    XHCIFirmwareRing *ring = &fw->endpoint[slot][epid];
+    dma_addr_t base = xhci_fw_transfer_ring(fw, slot, epid);
+
+    if (ring->enqueue == XHCI_FW_RING_TRBS - 1) {
+        if (!xhci_fw_write_trb(
+                xhci, base + ring->enqueue * TRB_SIZE, base, 0,
+                ring->cycle | (TR_LINK << TRB_TYPE_SHIFT) | TRB_LK_TC,
+                errp)) {
+            return false;
+        }
+        ring->enqueue = 0;
+        ring->cycle = !ring->cycle;
+    }
+    if (trb_address) {
+        *trb_address = base + ring->enqueue * TRB_SIZE;
+    }
+    if (!xhci_fw_write_trb(
+            xhci, base + ring->enqueue * TRB_SIZE, parameter, status,
+            control | ring->cycle, errp)) {
+        return false;
+    }
+    ring->enqueue++;
+    return true;
+}
+
+static bool xhci_fw_path_context(XHCIState *xhci, USBDevice *dev,
+                                 uint32_t *route, uint8_t *root_port,
+                                 Error **errp)
+{
+    USBPort *uport = dev->port;
+    unsigned int path[6] = { 0 };
+    unsigned int count = 0;
+    const char *cursor = uport->path;
+    const char *end;
+
+    while (*cursor && count < ARRAY_SIZE(path)) {
+        unsigned long component;
+
+        if (qemu_strtoul(cursor, &end, 10, &component) ||
+            component == 0 || component > 15) {
+            error_setg(errp, "xHCI firmware cannot encode USB path %s",
+                       uport->path);
+            return false;
+        }
+        path[count] = component;
+        count++;
+        cursor = *end == '.' ? end + 1 : end;
+    }
+    if (*cursor || !count) {
+        error_setg(errp, "xHCI firmware USB path %s is too deep",
+                   uport->path);
+        return false;
+    }
+
+    *root_port = 0;
+    for (unsigned int i = 0; i < xhci->numports; i++) {
+        if (xhci->ports[i].uport == &xhci->uports[path[0] - 1] &&
+            ((1 << dev->speed) & xhci->ports[i].speedmask)) {
+            *root_port = i + 1;
+            break;
+        }
+    }
+    if (!*root_port) {
+        error_setg(errp, "xHCI firmware found no protocol port for %s",
+                   uport->path);
+        return false;
+    }
+    *route = 0;
+    for (unsigned int i = 1; i < count; i++) {
+        *route |= path[i] << (4 * (i - 1));
+    }
+    return true;
+}
+
+static USBDevice *xhci_fw_find_device(XHCIState *xhci, uint8_t address)
+{
+    for (unsigned int port = 0;
+         port < xhci_host_firmware_port_count(xhci); port++) {
+        USBDevice *dev = usb_find_device(&xhci->uports[port], address);
+
+        if (dev) {
+            return dev;
+        }
+    }
+    return NULL;
+}
+
+static int xhci_fw_find_slot(XHCIState *xhci, uint8_t address)
+{
+    XHCIFirmwareHost *fw = xhci->firmware_host;
+
+    for (unsigned int slot = 1; slot <= XHCI_FW_MAX_SLOTS; slot++) {
+        if (fw->address[slot] == address &&
+            xhci->slots[slot - 1].enabled) {
+            return slot;
+        }
+    }
+    return 0;
+}
+
+static bool xhci_fw_address_device(XHCIState *xhci, USBDevice *dev,
+                                   uint8_t address, bool bsr,
+                                   uint8_t *slot_out, Error **errp)
+{
+    XHCIFirmwareHost *fw = xhci->firmware_host;
+    uint8_t slot = slot_out ? *slot_out : 0;
+    uint8_t root_port;
+    uint8_t event_slot = 0;
+    uint32_t route;
+    uint8_t input[96] = { 0 };
+    uint8_t dcbaa[8];
+    uint8_t empty_ring[XHCI_FW_TRANSFER_STRIDE] = { 0 };
+    dma_addr_t ictx;
+    dma_addr_t octx;
+    dma_addr_t ep0_ring;
+    uint32_t max_packet;
+
+    if (!slot) {
+        if (!xhci_fw_command(
+                xhci, CR_ENABLE_SLOT, 0, 0, 0, false,
+                &event_slot, errp)) {
+            return false;
+        }
+        slot = event_slot;
+    }
+    if (!slot || slot > XHCI_FW_MAX_SLOTS ||
+        !xhci_fw_path_context(
+            xhci, dev, &route, &root_port, errp)) {
+        return false;
+    }
+    ictx = xhci_fw_input_context(fw, slot);
+    octx = xhci_fw_output_context(fw, slot);
+    ep0_ring = xhci_fw_transfer_ring(fw, slot, 1);
+    max_packet = dev->ep_ctl.max_packet_size;
+    if (!max_packet) {
+        max_packet = dev->speed == USB_SPEED_SUPER ? 512 : 64;
+    }
+
+    stl_le_p(input + 4, 0x3);
+    stl_le_p(input + 32, route | (1u << SLOT_CONTEXT_ENTRIES_SHIFT));
+    stl_le_p(input + 36, root_port << 16);
+    stl_le_p(input + 64 + 4,
+             (max_packet << 16) | (ET_CONTROL << EP_TYPE_SHIFT));
+    stl_le_p(input + 64 + 8, ep0_ring | 1);
+    if (!xhci_fw_dma_write(xhci, ictx, input, sizeof(input), errp)) {
+        return false;
+    }
+    stq_le_p(dcbaa, octx);
+    if (!xhci_fw_dma_write(
+            xhci, xhci_fw_addr(fw, XHCI_FW_DCBAA) + slot * 8,
+            dcbaa, sizeof(dcbaa), errp)) {
+        return false;
+    }
+    fw->endpoint[slot][1].enqueue = 0;
+    fw->endpoint[slot][1].cycle = true;
+    if (!xhci_fw_dma_write(
+            xhci, ep0_ring, empty_ring, sizeof(empty_ring), errp)) {
+        return false;
+    }
+    if (!xhci_fw_command(
+            xhci, CR_ADDRESS_DEVICE, ictx, slot, 0, bsr, NULL, errp)) {
+        return false;
+    }
+    fw->address[slot] = address;
+    if (slot_out) {
+        *slot_out = slot;
+    }
+    return true;
+}
+
+static int xhci_fw_ensure_slot(XHCIState *xhci, uint8_t address,
+                               Error **errp)
+{
+    XHCIFirmwareHost *fw = xhci->firmware_host;
+    USBDevice *dev;
+    uint8_t slot = 0;
+    int existing = xhci_fw_find_slot(xhci, address);
+
+    if (existing) {
+        return existing;
+    }
+    dev = xhci_fw_find_device(xhci, address);
+    if (!dev || address != 0 ||
+        !xhci_fw_address_device(
+            xhci, dev, 0, true, &slot, errp)) {
+        if (!*errp) {
+            error_setg(errp, "xHCI firmware address %u was not found",
+                       address);
+        }
+        return 0;
+    }
+    fw->address[slot] = 0;
+    return slot;
+}
+
+static bool xhci_fw_configure_bulk(XHCIState *xhci, unsigned int slot,
+                                   Error **errp)
+{
+    XHCIFirmwareHost *fw = xhci->firmware_host;
+    USBDevice *dev = xhci->slots[slot - 1].uport->dev;
+    uint8_t input[32 + 32 * 5] = { 0 };
+    uint8_t empty_ring[XHCI_FW_TRANSFER_STRIDE] = { 0 };
+    dma_addr_t ictx = xhci_fw_input_context(fw, slot);
+    unsigned int epids[] = { 3, 4 };
+
+    stl_le_p(input + 4, 1 | (1 << 3) | (1 << 4));
+    stl_le_p(input + 32, 4u << SLOT_CONTEXT_ENTRIES_SHIFT);
+    for (unsigned int i = 0; i < ARRAY_SIZE(epids); i++) {
+        unsigned int epid = epids[i];
+        USBEndpoint *ep = usb_ep_get(
+            dev, epid == 3 ? USB_TOKEN_IN : USB_TOKEN_OUT,
+            epid == 3 ? 1 : 2);
+        uint8_t *ctx = input + 32 + 32 * epid;
+        dma_addr_t ring = xhci_fw_transfer_ring(fw, slot, epid);
+        EPType type = epid == 3 ? ET_BULK_IN : ET_BULK_OUT;
+
+        if (!ep || ep->type != USB_ENDPOINT_XFER_BULK ||
+            !ep->max_packet_size) {
+            error_setg(errp,
+                       "xHCI firmware slot %u lacks BOT endpoint %u",
+                       slot, epid);
+            return false;
+        }
+        stl_le_p(ctx + 4, (ep->max_packet_size << 16) |
+                              (type << EP_TYPE_SHIFT));
+        stl_le_p(ctx + 8, ring | 1);
+        fw->endpoint[slot][epid].enqueue = 0;
+        fw->endpoint[slot][epid].cycle = true;
+        if (!xhci_fw_dma_write(
+                xhci, ring, empty_ring, sizeof(empty_ring), errp)) {
+            return false;
+        }
+    }
+    if (!xhci_fw_dma_write(xhci, ictx, input, sizeof(input), errp) ||
+        !xhci_fw_command(
+            xhci, CR_CONFIGURE_ENDPOINT, ictx, slot, 0, false,
+            NULL, errp)) {
+        return false;
+    }
+    fw->endpoint_configured[slot][3] = true;
+    fw->endpoint_configured[slot][4] = true;
+    return true;
+}
+
+static ssize_t xhci_fw_submit_control(XHCIState *xhci, unsigned int slot,
+                                      bool in, void *buffer, size_t length,
+                                      Error **errp)
+{
+    XHCIFirmwareHost *fw = xhci->firmware_host;
+    uint64_t setup = ldq_le_p(fw->setup);
+    dma_addr_t completion_trb = 0;
+    uint32_t residual = 0;
+    uint32_t setup_control = (TR_SETUP << TRB_TYPE_SHIFT) | TRB_TR_IDT |
+                             TRB_TR_CH;
+
+    if (length > XHCI_FW_DATA_SIZE) {
+        error_setg(errp, "xHCI firmware control transfer is too large");
+        return -1;
+    }
+    if (length && !in &&
+        !xhci_fw_dma_write(
+            xhci, xhci_fw_addr(fw, XHCI_FW_DATA), buffer, length, errp)) {
+        return -1;
+    }
+    if (!xhci_fw_ring_put(
+            xhci, slot, 1, setup, 8, setup_control, NULL, errp)) {
+        return -1;
+    }
+    if (length &&
+        !xhci_fw_ring_put(
+            xhci, slot, 1, xhci_fw_addr(fw, XHCI_FW_DATA), length,
+            (TR_DATA << TRB_TYPE_SHIFT) | TRB_TR_CH | TRB_TR_IOC |
+            TRB_TR_ISP | (in ? TRB_TR_DIR : 0),
+            &completion_trb, errp)) {
+        return -1;
+    }
+    if (!xhci_fw_ring_put(
+            xhci, slot, 1, 0, 0,
+            (TR_STATUS << TRB_TYPE_SHIFT) |
+            (length ? 0 : TRB_TR_IOC) |
+            (in ? 0 : TRB_TR_DIR),
+            length ? NULL : &completion_trb, errp)) {
+        return -1;
+    }
+    xhci_doorbell_write(xhci, slot * 4, 1, 4);
+    if (!xhci_fw_next_event(
+            xhci, ER_TRANSFER, slot, completion_trb,
+            &residual, NULL, errp)) {
+        return -1;
+    }
+    if (residual > length) {
+        error_setg(errp, "xHCI firmware returned invalid control residual");
+        return -1;
+    }
+    length -= residual;
+    if (length && in &&
+        !xhci_fw_dma_read(
+            xhci, xhci_fw_addr(fw, XHCI_FW_DATA), buffer, length, errp)) {
+        return -1;
+    }
+    return length;
+}
+
+static ssize_t xhci_fw_submit_bulk(XHCIState *xhci, unsigned int slot,
+                                   unsigned int epid, bool in, void *buffer,
+                                   size_t length, Error **errp)
+{
+    XHCIFirmwareHost *fw = xhci->firmware_host;
+    dma_addr_t completion_trb;
+    uint32_t residual = 0;
+
+    if (!fw->endpoint_configured[slot][epid] &&
+        !xhci_fw_configure_bulk(xhci, slot, errp)) {
+        return -1;
+    }
+    if (length > XHCI_FW_DATA_SIZE) {
+        error_setg(errp, "xHCI firmware bulk transfer is too large");
+        return -1;
+    }
+    if (!in && !xhci_fw_dma_write(
+            xhci, xhci_fw_addr(fw, XHCI_FW_DATA),
+            buffer, length, errp)) {
+        return -1;
+    }
+    if (!xhci_fw_ring_put(
+            xhci, slot, epid, xhci_fw_addr(fw, XHCI_FW_DATA), length,
+            (TR_NORMAL << TRB_TYPE_SHIFT) | TRB_TR_IOC | TRB_TR_ISP,
+            &completion_trb, errp)) {
+        return -1;
+    }
+    xhci_doorbell_write(xhci, slot * 4, epid, 4);
+    if (!xhci_fw_next_event(
+            xhci, ER_TRANSFER, slot, completion_trb,
+            &residual, NULL, errp)) {
+        return -1;
+    }
+    if (residual > length) {
+        error_setg(errp, "xHCI firmware returned invalid bulk residual");
+        return -1;
+    }
+    length -= residual;
+    if (in && !xhci_fw_dma_read(
+            xhci, xhci_fw_addr(fw, XHCI_FW_DATA),
+            buffer, length, errp)) {
+        return -1;
+    }
+    return length;
+}
+
+bool xhci_host_firmware_init(XHCIState *xhci, dma_addr_t dma, Error **errp)
+{
+    XHCIFirmwareHost *fw;
+    g_autofree uint8_t *zero = NULL;
+    uint8_t erst[16] = { 0 };
+
+    if (dma & 0xffff) {
+        error_setg(errp, "xHCI firmware DMA base must be 64 KiB aligned");
+        return false;
+    }
+    if (xhci->firmware_host &&
+        xhci->firmware_host->initialized &&
+        xhci->firmware_host->dma == dma) {
+        return true;
+    }
+
+    xhci_oper_write(xhci, 0, USBCMD_HCRST, 4);
+    xhci->firmware_host = g_new0(XHCIFirmwareHost, 1);
+    fw = xhci->firmware_host;
+    memset(fw, 0, sizeof(*fw));
+    fw->dma = dma;
+    fw->command_cycle = true;
+    fw->event_cycle = true;
+    memset(fw->address, UINT8_MAX, sizeof(fw->address));
+
+    zero = g_malloc0(XHCI_FW_DMA_SIZE);
+    if (!xhci_fw_dma_write(xhci, dma, zero, XHCI_FW_DMA_SIZE, errp)) {
+        return false;
+    }
+    stl_le_p(erst, xhci_fw_addr(fw, XHCI_FW_EVENT_RING));
+    stl_le_p(erst + 8, XHCI_FW_EVENT_TRBS);
+    if (!xhci_fw_dma_write(
+            xhci, xhci_fw_addr(fw, XHCI_FW_ERST),
+            erst, sizeof(erst), errp)) {
+        return false;
+    }
+
+    xhci_oper_write(xhci, 0x30, xhci_fw_addr(fw, XHCI_FW_DCBAA), 4);
+    xhci_oper_write(xhci, 0x34, 0, 4);
+    xhci_oper_write(
+        xhci, 0x18, xhci_fw_addr(fw, XHCI_FW_COMMAND_RING) | CRCR_RCS, 4);
+    xhci_oper_write(xhci, 0x1c, 0, 4);
+    xhci_runtime_write(xhci, 0x28, 1, 4);
+    xhci_runtime_write(
+        xhci, 0x30, xhci_fw_addr(fw, XHCI_FW_ERST), 4);
+    xhci_runtime_write(xhci, 0x34, 0, 4);
+    xhci_runtime_write(
+        xhci, 0x38, xhci_fw_addr(fw, XHCI_FW_EVENT_RING), 4);
+    xhci_runtime_write(xhci, 0x3c, 0, 4);
+    xhci_oper_write(
+        xhci, 0x38, MIN(xhci->numslots, XHCI_FW_MAX_SLOTS), 4);
+    xhci_oper_write(xhci, 0, USBCMD_RS, 4);
+    fw->initialized = true;
+    return true;
+}
+
+bool xhci_host_firmware_reset_port(XHCIState *xhci, unsigned int port,
+                                   Error **errp)
+{
+    XHCIFirmwareHost *fw = xhci->firmware_host;
+    USBPort *uport;
+
+    if (port >= xhci_host_firmware_port_count(xhci)) {
+        error_setg(errp, "xHCI firmware host port %u is out of range", port);
+        return false;
+    }
+    uport = &xhci->uports[port];
+    if (!uport->dev || !uport->dev->attached ||
+        uport->dev->state == USB_STATE_NOTATTACHED) {
+        error_setg(errp,
+                   "xHCI firmware host port %u has no attached device", port);
+        return false;
+    }
+    if (fw && fw->initialized) {
+        size_t root_length = strlen(uport->path);
+
+        for (unsigned int slot = 1;
+             slot <= MIN(xhci->numslots, XHCI_FW_MAX_SLOTS); slot++) {
+            USBPort *assigned = xhci->slots[slot - 1].uport;
+
+            if (!xhci->slots[slot - 1].enabled || !assigned ||
+                strncmp(assigned->path, uport->path, root_length) ||
+                (assigned->path[root_length] &&
+                 assigned->path[root_length] != '.')) {
+                continue;
+            }
+            if (!xhci_fw_command(
+                    xhci, CR_DISABLE_SLOT, 0, slot, 0, false,
+                    NULL, errp)) {
+                return false;
+            }
+            fw->address[slot] = UINT8_MAX;
+            memset(fw->endpoint_configured[slot], 0,
+                   sizeof(fw->endpoint_configured[slot]));
+        }
+        fw->control_pending = false;
+        fw->control_status_pending = false;
+    }
+    for (unsigned int i = 0; i < xhci->numports; i++) {
+        XHCIPort *xport = &xhci->ports[i];
+
+        if (xport->uport == uport &&
+            ((1 << uport->dev->speed) & xport->speedmask)) {
+            xhci_port_write(
+                xport, 0, uport->dev->speed == USB_SPEED_SUPER ?
+                PORTSC_WPR : PORTSC_PR, 4);
+            return true;
+        }
+    }
+    error_setg(errp, "xHCI firmware host port %u has no protocol port", port);
+    return false;
+}
+
+bool xhci_host_firmware_recover_endpoint(XHCIState *xhci, uint8_t address,
+                                         uint8_t endpoint, bool in,
+                                         Error **errp)
+{
+    XHCIFirmwareHost *fw = xhci->firmware_host;
+    uint8_t empty_ring[XHCI_FW_TRANSFER_STRIDE] = { 0 };
+    unsigned int epid;
+    dma_addr_t ring;
+    int slot;
+
+    if (!fw || !fw->initialized || !endpoint || endpoint > 15) {
+        error_setg(errp, "invalid xHCI firmware endpoint recovery");
+        return false;
+    }
+    slot = xhci_fw_find_slot(xhci, address);
+    if (!slot) {
+        error_setg(errp, "xHCI firmware recovery address %u was not found",
+                   address);
+        return false;
+    }
+    epid = endpoint * 2 + (in ? 1 : 0);
+    if (!xhci->slots[slot - 1].eps[epid - 1]) {
+        error_setg(errp, "xHCI firmware recovery endpoint %u is disabled",
+                   epid);
+        return false;
+    }
+    if (xhci->slots[slot - 1].eps[epid - 1]->state != EP_HALTED) {
+        return true;
+    }
+    if (!xhci_fw_command(
+            xhci, CR_RESET_ENDPOINT, 0, slot, epid, false, NULL, errp)) {
+        return false;
+    }
+
+    ring = xhci_fw_transfer_ring(fw, slot, epid);
+    if (!xhci_fw_dma_write(
+            xhci, ring, empty_ring, sizeof(empty_ring), errp)) {
+        return false;
+    }
+    fw->endpoint[slot][epid].enqueue = 0;
+    fw->endpoint[slot][epid].cycle = true;
+    return xhci_fw_command(
+        xhci, CR_SET_TR_DEQUEUE, ring | 1, slot, epid, false, NULL, errp);
+}
+
+ssize_t xhci_host_firmware_transfer(XHCIState *xhci, uint8_t address,
+                                    uint8_t endpoint, uint8_t type,
+                                    bool in, void *buffer, size_t length,
+                                    Error **errp)
+{
+    XHCIFirmwareHost *fw = xhci->firmware_host;
+    int slot;
+
+    if (address > 127 || endpoint > 15 ||
+        type > USB_ENDPOINT_XFER_INT) {
+        error_setg(errp, "invalid xHCI firmware host transfer");
+        return -1;
+    }
+    if (!fw || !fw->initialized) {
+        error_setg(errp, "xHCI firmware host is not initialized");
+        return -1;
+    }
+    slot = xhci_fw_ensure_slot(xhci, address, errp);
+    if (!slot) {
+        return -1;
+    }
+
+    if (type == USB_ENDPOINT_XFER_CONTROL && endpoint == 0) {
+        if (!in && length == 8) {
+            memcpy(fw->setup, buffer, sizeof(fw->setup));
+            DPRINTF("xhci-fw: setup slot=%d req=%02x type=%02x len=%u\n",
+                    slot, fw->setup[1], fw->setup[0],
+                    lduw_le_p(fw->setup + 6));
+            fw->control_pending = true;
+            fw->control_status_pending = false;
+            fw->control_slot = slot;
+            return sizeof(fw->setup);
+        }
+        if (!fw->control_pending || fw->control_slot != slot) {
+            if (!length && fw->control_status_pending) {
+                fw->control_status_pending = false;
+                return 0;
+            }
+            error_setg(errp, "xHCI firmware control TD has no Setup stage");
+            return -1;
+        }
+        if (!length && fw->setup[1] == USB_REQ_SET_ADDRESS &&
+            !(fw->setup[0] & USB_DIR_IN)) {
+            USBDevice *dev = xhci->slots[slot - 1].uport->dev;
+            uint8_t requested = fw->setup[2];
+            uint8_t same_slot = slot;
+
+            fw->control_pending = false;
+            DPRINTF("xhci-fw: address slot=%d requested=%u\n",
+                    slot, requested);
+            fw->address[slot] = UINT8_MAX;
+            if (!xhci_fw_address_device(
+                    xhci, dev, requested, false, &same_slot, errp)) {
+                return -1;
+            }
+            return 0;
+        }
+        fw->control_pending = false;
+        fw->control_status_pending = length != 0;
+        DPRINTF("xhci-fw: submit control slot=%d req=%02x in=%d len=%zu\n",
+                slot, fw->setup[1], in, length);
+        return xhci_fw_submit_control(
+            xhci, slot, in, buffer, length, errp);
+    }
+    if (type != USB_ENDPOINT_XFER_BULK ||
+        (endpoint != 1 && endpoint != 2)) {
+        error_setg(errp, "xHCI firmware endpoint %u is unsupported",
+                   endpoint);
+        return -1;
+    }
+    return xhci_fw_submit_bulk(
+        xhci, slot, endpoint == 1 ? 3 : 4, in, buffer, length, errp);
+}
+
 static void xhci_child_detach(USBPort *uport, USBDevice *child)
 {
     USBBus *bus = usb_bus_from_device(child);
@@ -3465,6 +4266,7 @@ static void usb_xhci_unrealize(DeviceState *dev)
     XHCIState *xhci = XHCI(dev);
 
     trace_usb_xhci_exit();
+    g_clear_pointer(&xhci->firmware_host, g_free);
 
     for (i = 0; i < xhci->numslots; i++) {
         xhci_disable_slot(xhci, i + 1);

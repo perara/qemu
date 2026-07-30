@@ -20,9 +20,11 @@
 #define HW_USB_HCD_DWC2_H
 
 #include "qemu/timer.h"
+#include "chardev/char-fe.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/usb/usb.h"
+#include "hw/usb/dwc2-device-transport.h"
 #include "system/dma.h"
 #include "qom/object.h"
 
@@ -34,6 +36,21 @@
 typedef struct DWC2Packet DWC2Packet;
 typedef struct DWC2State DWC2State;
 typedef struct DWC2Class DWC2Class;
+typedef void (*DWC2DevicePacketHandler)(void *opaque, unsigned int ep,
+                                        bool in, bool setup,
+                                        const uint8_t *data, size_t length,
+                                        bool complete);
+typedef void (*DWC2DeviceEventHandler)(void *opaque, unsigned int event,
+                                       unsigned int value);
+
+enum DWC2DeviceEvent {
+    DWC2_DEVICE_EVENT_CONNECT,
+    DWC2_DEVICE_EVENT_DISCONNECT,
+    DWC2_DEVICE_EVENT_RESET,
+    DWC2_DEVICE_EVENT_ENUM_DONE,
+    DWC2_DEVICE_EVENT_SUSPEND,
+    DWC2_DEVICE_EVENT_RESUME,
+};
 
 enum async_state {
     DWC2_ASYNC_NONE = 0,
@@ -113,6 +130,10 @@ struct DWC2State {
         };
     };
 
+    /* Device periodic Tx FIFO sizes at 0x104-0x13c. */
+#define DWC2_DPTXFSZ_COUNT  15
+    uint32_t dptxfsiz[DWC2_DPTXFSZ_COUNT];
+
     union {
 #define DWC2_HREG0_SIZE     0x44
         uint32_t hreg0[DWC2_HREG0_SIZE / sizeof(uint32_t)];
@@ -142,6 +163,44 @@ struct DWC2State {
 #define hcdmab(_ch)     hreg1[((_ch) << 3) + 7] /* 51c, 53c, ... */
 
     union {
+#define DWC2_DREG_SIZE      0x40
+        uint32_t dreg[DWC2_DREG_SIZE / sizeof(uint32_t)];
+        struct {
+            uint32_t dcfg;          /* 800 */
+            uint32_t dctl;          /* 804 */
+            uint32_t dsts;          /* 808 */
+            uint32_t rsvd_d0;       /* 80c */
+            uint32_t diepmsk;       /* 810 */
+            uint32_t doepmsk;       /* 814 */
+            uint32_t daint;         /* 818 */
+            uint32_t daintmsk;      /* 81c */
+            uint32_t dtknqr1;       /* 820 */
+            uint32_t dtknqr2;       /* 824 */
+            uint32_t dvbusdis;      /* 828 */
+            uint32_t dvbuspulse;    /* 82c */
+            uint32_t dtknqr3;       /* 830 */
+            uint32_t diepepmsk;     /* 834 */
+            uint32_t rsvd_d1[2];    /* 838-83c */
+        };
+    };
+
+#define DWC2_DEV_EP_COUNT    16
+#define DWC2_DEPREG_SIZE     (0x20 * DWC2_DEV_EP_COUNT)
+    uint32_t diepreg[DWC2_DEPREG_SIZE / sizeof(uint32_t)];
+    uint32_t doepreg[DWC2_DEPREG_SIZE / sizeof(uint32_t)];
+
+#define diepctl(_ep) diepreg[((_ep) << 3) + 0]
+#define diepint(_ep) diepreg[((_ep) << 3) + 2]
+#define dieptsiz(_ep) diepreg[((_ep) << 3) + 4]
+#define diepdma(_ep) diepreg[((_ep) << 3) + 5]
+#define dtxfsts(_ep) diepreg[((_ep) << 3) + 6]
+
+#define doepctl(_ep) doepreg[((_ep) << 3) + 0]
+#define doepint(_ep) doepreg[((_ep) << 3) + 2]
+#define doeptsiz(_ep) doepreg[((_ep) << 3) + 4]
+#define doepdma(_ep) doepreg[((_ep) << 3) + 5]
+
+    union {
 #define DWC2_PCGREG_SIZE    0x08
         uint32_t pcgreg[DWC2_PCGREG_SIZE / sizeof(uint32_t)];
         struct {
@@ -150,8 +209,31 @@ struct DWC2State {
         };
     };
 
-    /* TODO - implement FIFO registers for slave mode */
-#define DWC2_HFIFO_SIZE     (0x1000 * DWC2_NB_CHAN)
+    /*
+     * The BCM2711 integration advertises 4096 32-bit FIFO words.  Keep a
+     * bounded backing store for every device Tx FIFO so configured FIFO
+     * depths, PIO payloads, flushes, and migration are observable.
+     */
+#define DWC2_FIFO_WORDS       4096
+#define DWC2_FIFO_BYTES       (DWC2_FIFO_WORDS * sizeof(uint32_t))
+#define DWC2_RX_STATUS_COUNT  64
+#define DWC2_HFIFO_SIZE       (0x1000 * DWC2_DEV_EP_COUNT)
+
+    uint8_t rx_fifo[DWC2_FIFO_BYTES];
+    uint32_t rx_fifo_head;
+    uint32_t rx_fifo_count;
+    uint32_t rx_status[DWC2_RX_STATUS_COUNT];
+    uint32_t rx_status_head;
+    uint32_t rx_status_count;
+    uint8_t tx_fifo[DWC2_DEV_EP_COUNT][DWC2_FIFO_BYTES];
+    uint32_t tx_fifo_head[DWC2_DEV_EP_COUNT];
+    uint32_t tx_fifo_count[DWC2_DEV_EP_COUNT];
+    uint8_t host_tx_fifo[DWC2_NB_CHAN][DWC2_FIFO_BYTES];
+    uint32_t host_tx_fifo_head[DWC2_NB_CHAN];
+    uint32_t host_tx_fifo_count[DWC2_NB_CHAN];
+    bool host_pio_waiting[DWC2_NB_CHAN];
+    uint32_t host_pio_rx_reserved_bytes[DWC2_NB_CHAN];
+    bool host_pio_rx_reserved_active[DWC2_NB_CHAN];
 
     /*
      *  Internal state
@@ -167,6 +249,15 @@ struct DWC2State {
     uint16_t fi;
     uint16_t next_chan;
     bool working;
+    bool device_connected;
+    CharFrontend device_chr;
+    uint32_t device_rx_used;
+    uint8_t device_rx_buf[DWC2_DEVICE_TRANSPORT_HEADER_SIZE +
+                          DWC2_DEVICE_TRANSPORT_MAX_PAYLOAD];
+    uint8_t device_tx_buf[DWC2_DEVICE_TRANSPORT_MAX_PAYLOAD];
+    DWC2DevicePacketHandler device_packet_handler;
+    DWC2DeviceEventHandler device_event_handler;
+    void *device_handler_opaque;
     USBPort uport;
     DWC2Packet packet[DWC2_NB_CHAN];                   /* one packet per chan */
     uint8_t usb_buf[DWC2_NB_CHAN][DWC2_MAX_XFER_SIZE]; /* one buffer per chan */
@@ -182,5 +273,43 @@ struct DWC2Class {
 
 #define TYPE_DWC2_USB   "dwc2-usb"
 OBJECT_DECLARE_TYPE(DWC2State, DWC2Class, DWC2_USB)
+
+/*
+ * Behavioral firmware host boundary.  These helpers execute the same host
+ * channel engine, USB packets, DMA, hub routing, and endpoint models as MMIO
+ * programming while the VideoCore replacement owns the controller pre-ARM.
+ */
+bool dwc2_host_firmware_reset_port(DWC2State *s, Error **errp);
+bool dwc2_host_firmware_abort_transfer(DWC2State *s, Error **errp);
+ssize_t dwc2_host_firmware_transfer(
+    DWC2State *s, uint8_t address, uint8_t endpoint, uint8_t type,
+    uint16_t max_packet, bool in, uint32_t pid, uint32_t dma,
+    void *buffer, size_t length, Error **errp);
+
+/*
+ * Host-facing device-mode boundary.  A transport such as USB/IP or Raw Gadget
+ * feeds host tokens through these functions; the DWC2 model owns endpoint
+ * readiness, DMA, transfer-size accounting, and interrupts.
+ */
+void dwc2_device_host_connect(DWC2State *s, bool connected);
+void dwc2_device_host_reset(DWC2State *s);
+void dwc2_device_host_enum_done(DWC2State *s, unsigned int speed);
+void dwc2_device_host_suspend(DWC2State *s, bool suspended);
+ssize_t dwc2_device_host_send(DWC2State *s, unsigned int ep,
+                              const void *buf, size_t len, bool setup);
+ssize_t dwc2_device_host_receive(DWC2State *s, unsigned int ep,
+                                 void *buf, size_t len);
+void dwc2_device_set_firmware_handlers(DWC2State *s,
+                                       DWC2DevicePacketHandler packet,
+                                       DWC2DeviceEventHandler event,
+                                       void *opaque);
+void dwc2_device_firmware_start(DWC2State *s);
+int dwc2_device_firmware_arm_out(DWC2State *s, unsigned int ep,
+                                 uint32_t dma, size_t length, uint32_t mps,
+                                 uint32_t type, bool setup);
+int dwc2_device_firmware_arm_in(DWC2State *s, unsigned int ep,
+                                uint32_t dma, const void *data, size_t length,
+                                uint32_t mps, uint32_t type);
+void dwc2_device_firmware_disable_endpoint(DWC2State *s, unsigned int ep);
 
 #endif

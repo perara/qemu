@@ -355,11 +355,35 @@ static void usb_msd_handle_control(USBDevice *dev, USBPacket *p,
 
     switch (request) {
     case EndpointOutRequest | USB_REQ_CLEAR_FEATURE:
+        if (value != USB_ENDPOINT_HALT ||
+            ((index & USB_DIR_IN) && (index & 0x0f) != 1) ||
+            (!(index & USB_DIR_IN) && (index & 0x0f) != 2)) {
+            p->status = USB_RET_STALL;
+            break;
+        }
+        usb_ep_set_halted(dev,
+                          index & USB_DIR_IN ? USB_TOKEN_IN : USB_TOKEN_OUT,
+                          index & 0x0f, false);
         break;
         /* Class specific requests.  */
     case ClassInterfaceOutRequest | MassStorageReset:
-        /* Reset state ready for the next CBW.  */
+        if (value || index || length) {
+            p->status = USB_RET_STALL;
+            break;
+        }
+        if (s->req) {
+            scsi_req_cancel(s->req);
+        }
+        assert(s->req == NULL);
+        if (s->packet) {
+            usb_msd_packet_complete(s, USB_RET_STALL);
+        }
+        memset(&s->csw, 0, sizeof(s->csw));
+        s->scsi_len = 0;
+        s->scsi_off = 0;
+        s->data_len = 0;
         s->mode = USB_MSDM_CBW;
+        s->needs_reset = false;
         break;
     case ClassInterfaceRequest | GetMaxLun:
         maxlun = 0;
@@ -551,6 +575,12 @@ static void usb_msd_handle_data(USBDevice *dev, USBPacket *p)
 
     default:
     fail:
+        /*
+         * USB Mass Storage BOT requires a class-specific reset after an
+         * invalid CBW or an unrecoverable phase error.  Keep stalling bulk
+         * traffic until the host performs that recovery sequence.
+         */
+        s->needs_reset = true;
         p->status = USB_RET_STALL;
         break;
     }

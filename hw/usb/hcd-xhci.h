@@ -25,6 +25,7 @@
 
 #include "hw/usb/usb.h"
 #include "hw/usb/xhci.h"
+#include "qapi/error.h"
 #include "system/dma.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(XHCIState, XHCI)
@@ -34,6 +35,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(XHCIState, XHCI)
 
 typedef struct XHCIStreamContext XHCIStreamContext;
 typedef struct XHCIEPContext XHCIEPContext;
+typedef struct XHCIFirmwareHost XHCIFirmwareHost;
 
 enum xhci_flags {
     XHCI_FLAG_ENABLE_STREAMS = 1,
@@ -223,9 +225,22 @@ typedef struct XHCIState {
     XHCIRing cmd_ring;
 
     bool nec_quirks;
+    XHCIFirmwareHost *firmware_host;
 } XHCIState;
 
 extern const VMStateDescription vmstate_xhci;
 bool xhci_get_flag(XHCIState *xhci, enum xhci_flags bit);
 void xhci_set_flag(XHCIState *xhci, enum xhci_flags bit);
+unsigned int xhci_host_firmware_port_count(XHCIState *xhci);
+bool xhci_host_firmware_init(XHCIState *xhci, dma_addr_t dma,
+                             Error **errp);
+bool xhci_host_firmware_reset_port(XHCIState *xhci, unsigned int port,
+                                   Error **errp);
+bool xhci_host_firmware_recover_endpoint(XHCIState *xhci, uint8_t address,
+                                         uint8_t endpoint, bool in,
+                                         Error **errp);
+ssize_t xhci_host_firmware_transfer(XHCIState *xhci, uint8_t address,
+                                    uint8_t endpoint, uint8_t type,
+                                    bool in, void *buffer, size_t length,
+                                    Error **errp);
 #endif

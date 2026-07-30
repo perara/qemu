@@ -236,12 +236,17 @@ usb_dwc2_pcgreg_read(uint64_t addr, const char *reg, uint32_t val) " 0x%04" PRIx
 usb_dwc2_pcgreg_write(uint64_t addr, const char *reg, uint64_t val, uint32_t old, uint64_t result) "0x%04" PRIx64 " %s val 0x%08" PRIx64 " old 0x%08x result 0x%08" PRIx64
 usb_dwc2_hreg2_read(uint64_t addr, uint64_t fifo, uint32_t val) "  0x%04" PRIx64 " FIFO%" PRId64 "     val 0x%08x"
 usb_dwc2_hreg2_write(uint64_t addr, uint64_t fifo, uint64_t val, uint32_t old, uint64_t result) " 0x%04" PRIx64 " FIFO%" PRId64 "     val 0x%08" PRIx64 " old 0x%08x result 0x%08" PRIx64
+usb_dwc2_depreg_write(bool in, uint32_t ep, uint64_t addr, uint32_t old, uint64_t result) "in %d ep%u addr 0x%04" PRIx64 " old 0x%08x result 0x%08" PRIx64
 usb_dwc2_hreg0_action(const char *s) "%s"
 usb_dwc2_wakeup_endpoint(void *ep, uint32_t stream) "endp %p stream %d"
 usb_dwc2_work_timer(void) ""
 usb_dwc2_reset_enter(void) "=== RESET enter ==="
 usb_dwc2_reset_hold(void) "=== RESET hold ==="
 usb_dwc2_reset_exit(void) "=== RESET exit ==="
+usb_dwc2_device_connect(bool connected) "connected %d"
+usb_dwc2_device_reset(void) ""
+usb_dwc2_device_enum_done(uint32_t speed) "speed %u"
+usb_dwc2_device_packet(uint32_t ep, bool in, uint64_t actual, uint32_t remaining, uint32_t packets, bool setup) "ep %u in %d actual %" PRIu64 " remaining %u packets %u setup %d"
 
 # desc.c
 usb_desc_device(int addr, int len, int ret) "dev %d query device, len %d, ret %d"
