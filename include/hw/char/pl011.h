@@ -52,6 +52,20 @@ struct PL011State {
     Clock *clk;
     bool migrate_clk;
     bool logged_disabled_uart;
+    bool hci_controller;
+    uint8_t hci_tx[1029];
+    uint16_t hci_tx_size;
+    uint16_t hci_tx_expected;
+    uint8_t hci_rx[1029];
+    uint16_t hci_rx_size;
+    uint16_t hci_rx_expected;
+    uint8_t hci_event[260];
+    uint16_t hci_event_size;
+    uint16_t hci_event_offset;
+    uint64_t hci_commands;
+    uint64_t hci_events;
+    uint64_t hci_acl_tx_packets;
+    uint64_t hci_acl_rx_packets;
     const unsigned char *id;
     /*
      * Since some users embed this struct directly, we must

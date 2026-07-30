@@ -196,6 +196,190 @@ static void pl011_fifo_rx_put(void *opaque, uint32_t value)
     }
 }
 
+static void pl011_hci_pump(PL011State *s)
+{
+    unsigned int fifo_depth;
+
+    if (!s->hci_controller) {
+        return;
+    }
+    fifo_depth = pl011_get_fifo_depth(s);
+    while (s->hci_event_offset < s->hci_event_size &&
+           s->read_count < fifo_depth) {
+        pl011_fifo_rx_put(s, s->hci_event[s->hci_event_offset++]);
+    }
+    if (s->hci_event_offset == s->hci_event_size) {
+        s->hci_event_offset = 0;
+        s->hci_event_size = 0;
+    }
+}
+
+static void pl011_hci_command_complete(PL011State *s, uint16_t opcode)
+{
+    uint8_t *event = s->hci_event;
+    unsigned int size = 7;
+
+    memset(event, 0, sizeof(s->hci_event));
+    event[0] = 0x04;
+    event[1] = 0x0e;
+    event[3] = 1;
+    event[4] = opcode;
+    event[5] = opcode >> 8;
+    switch (opcode) {
+    case 0x1001: /* Read Local Version Information */
+        event[7] = 0x09;
+        stw_le_p(event + 8, 0x0001);
+        event[10] = 0x09;
+        stw_le_p(event + 11, 0x000f); /* Broadcom */
+        stw_le_p(event + 13, 0x6119);
+        size = 15;
+        break;
+    case 0x1002: /* Read Local Supported Commands */
+        /*
+         * Keep optional-command advertisement conservative.  Mandatory
+         * initialization commands are still implemented, while zero bits
+         * prevent Linux from probing unsupported optional return formats.
+         */
+        size = 71;
+        break;
+    case 0x1003: /* Read Local Supported Features */
+        size = 15;
+        break;
+    case 0x1005: /* Read Buffer Size */
+        stw_le_p(event + 7, 1021);
+        event[9] = 64;
+        stw_le_p(event + 10, 8);
+        stw_le_p(event + 12, 4);
+        size = 14;
+        break;
+    case 0x1009: /* Read BD_ADDR */
+        event[7] = 0x55;
+        event[8] = 0x44;
+        event[9] = 0x33;
+        event[10] = 0x22;
+        event[11] = 0x11;
+        event[12] = 0x02;
+        size = 13;
+        break;
+    case 0x0c14: /* Read Local Name */
+        memcpy(event + 7, "QEMU CYW43455 Bluetooth",
+               sizeof("QEMU CYW43455 Bluetooth"));
+        size = 255;
+        break;
+    case 0x0c23: /* Read Class of Device */
+        event[7] = 0x00;
+        event[8] = 0x00;
+        event[9] = 0x00;
+        size = 10;
+        break;
+    case 0x0c25: /* Read Voice Setting */
+        stw_le_p(event + 7, 0x0060);
+        size = 9;
+        break;
+    case 0x0c38: /* Read Number of Supported IAC */
+        event[7] = 1;
+        size = 8;
+        break;
+    case 0x0c39: /* Read Current IAC LAP */
+        event[7] = 1;
+        event[8] = 0x33;
+        event[9] = 0x8b;
+        event[10] = 0x9e;
+        size = 11;
+        break;
+    case 0xfc5a: /* Read USB Product */
+        stl_le_p(event + 7, 0x0000a9bf);
+        size = 11;
+        break;
+    case 0xfc6e: /* Read Controller Features */
+        event[7] = 0x01;
+        size = 15;
+        break;
+    case 0xfc79: /* Read Verbose Config */
+        event[7] = 0x4a;
+        event[8] = 0x00;
+        stw_le_p(event + 9, 0x6119);
+        stw_le_p(event + 11, 0x0001);
+        size = 13;
+        break;
+    default:
+        break;
+    }
+    event[2] = size - 3;
+    s->hci_event_size = size;
+    s->hci_event_offset = 0;
+    s->hci_events++;
+    pl011_hci_pump(s);
+}
+
+static uint16_t pl011_hci_expected(const uint8_t *packet, uint16_t size)
+{
+    switch (packet[0]) {
+    case 0x01:
+        return size >= 4 ? 4 + packet[3] : 0;
+    case 0x02:
+        return size >= 5 ? 5 + lduw_le_p(packet + 3) : 0;
+    case 0x03:
+        return size >= 4 ? 4 + packet[3] : 0;
+    case 0x04:
+        return size >= 3 ? 3 + packet[2] : 0;
+    case 0x05:
+        return size >= 5 ? 5 + (lduw_le_p(packet + 3) & 0x3fff) : 0;
+    default:
+        return 1;
+    }
+}
+
+static void pl011_hci_tx(PL011State *s, uint8_t data)
+{
+    uint16_t opcode;
+
+    if (!s->hci_controller) {
+        return;
+    }
+    if (s->hci_tx_size == sizeof(s->hci_tx)) {
+        s->hci_tx_size = 0;
+        s->hci_tx_expected = 0;
+    }
+    s->hci_tx[s->hci_tx_size++] = data;
+    s->hci_tx_expected = pl011_hci_expected(s->hci_tx, s->hci_tx_size);
+    if (!s->hci_tx_expected || s->hci_tx_size < s->hci_tx_expected) {
+        return;
+    }
+    if (s->hci_tx[0] == 0x01) {
+        opcode = lduw_le_p(s->hci_tx + 1);
+        s->hci_commands++;
+        pl011_hci_command_complete(s, opcode);
+    } else if (s->hci_tx[0] == 0x02) {
+        s->hci_acl_tx_packets++;
+    }
+    s->hci_tx_size = 0;
+    s->hci_tx_expected = 0;
+}
+
+static void pl011_hci_rx(PL011State *s, uint8_t data)
+{
+    if (!s->hci_controller) {
+        return;
+    }
+    if (s->hci_rx_size == sizeof(s->hci_rx)) {
+        s->hci_rx_size = 0;
+        s->hci_rx_expected = 0;
+    }
+    s->hci_rx[s->hci_rx_size++] = data;
+    s->hci_rx_expected = pl011_hci_expected(s->hci_rx, s->hci_rx_size);
+    if (!s->hci_rx_expected || s->hci_rx_size < s->hci_rx_expected) {
+        return;
+    }
+    if (s->hci_rx[0] == 0x02) {
+        s->hci_acl_rx_packets++;
+    } else if (s->hci_rx[0] == 0x04) {
+        s->hci_events++;
+    }
+    s->hci_rx_size = 0;
+    s->hci_rx_expected = 0;
+}
+
 static void pl011_loopback_tx(PL011State *s, uint32_t value)
 {
     if (!pl011_loopback_enabled(s)) {
@@ -255,6 +439,7 @@ static void pl011_write_txdata(PL011State *s, uint8_t data)
      * qemu_chr_fe_write and background I/O callbacks
      */
     qemu_chr_fe_write_all(&s->chr, &data, 1);
+    pl011_hci_tx(s, data);
     pl011_loopback_tx(s, data);
     s->int_level |= INT_TX;
     pl011_update(s);
@@ -280,6 +465,7 @@ static uint32_t pl011_read_rxdata(PL011State *s)
     trace_pl011_read_fifo(s->read_count, fifo_depth);
     s->rsr = c >> 8;
     pl011_update(s);
+    pl011_hci_pump(s);
     qemu_chr_fe_accept_input(&s->chr);
     return c;
 }
@@ -536,6 +722,7 @@ static void pl011_receive(void *opaque, const uint8_t *buf, int size)
     }
 
     for (int i = 0; i < size; i++) {
+        pl011_hci_rx(opaque, buf[i]);
         pl011_fifo_rx_put(opaque, buf[i]);
     }
 }
@@ -584,9 +771,25 @@ static int pl011_post_load(void *opaque, int version_id)
 {
     PL011State* s = opaque;
 
+    if (version_id < 3) {
+        s->hci_tx_size = 0;
+        s->hci_tx_expected = 0;
+        s->hci_rx_size = 0;
+        s->hci_rx_expected = 0;
+        s->hci_event_size = 0;
+        s->hci_event_offset = 0;
+        s->hci_commands = 0;
+        s->hci_events = 0;
+        s->hci_acl_tx_packets = 0;
+        s->hci_acl_rx_packets = 0;
+    }
     /* Sanity-check input state */
     if (s->read_pos >= ARRAY_SIZE(s->read_fifo) ||
-        s->read_count > ARRAY_SIZE(s->read_fifo)) {
+        s->read_count > ARRAY_SIZE(s->read_fifo) ||
+        s->hci_tx_size > sizeof(s->hci_tx) ||
+        s->hci_rx_size > sizeof(s->hci_rx) ||
+        s->hci_event_size > sizeof(s->hci_event) ||
+        s->hci_event_offset > s->hci_event_size) {
         return -1;
     }
 
@@ -603,13 +806,14 @@ static int pl011_post_load(void *opaque, int version_id)
 
     s->ibrd &= IBRD_MASK;
     s->fbrd &= FBRD_MASK;
+    pl011_hci_pump(s);
 
     return 0;
 }
 
 static const VMStateDescription vmstate_pl011 = {
     .name = "pl011",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 2,
     .post_load = pl011_post_load,
     .fields = (const VMStateField[]) {
@@ -629,6 +833,19 @@ static const VMStateDescription vmstate_pl011 = {
         VMSTATE_INT32(read_pos, PL011State),
         VMSTATE_INT32(read_count, PL011State),
         VMSTATE_INT32(read_trigger, PL011State),
+        VMSTATE_UINT8_ARRAY_V(hci_tx, PL011State, 1029, 3),
+        VMSTATE_UINT16_V(hci_tx_size, PL011State, 3),
+        VMSTATE_UINT16_V(hci_tx_expected, PL011State, 3),
+        VMSTATE_UINT8_ARRAY_V(hci_rx, PL011State, 1029, 3),
+        VMSTATE_UINT16_V(hci_rx_size, PL011State, 3),
+        VMSTATE_UINT16_V(hci_rx_expected, PL011State, 3),
+        VMSTATE_UINT8_ARRAY_V(hci_event, PL011State, 260, 3),
+        VMSTATE_UINT16_V(hci_event_size, PL011State, 3),
+        VMSTATE_UINT16_V(hci_event_offset, PL011State, 3),
+        VMSTATE_UINT64_V(hci_commands, PL011State, 3),
+        VMSTATE_UINT64_V(hci_events, PL011State, 3),
+        VMSTATE_UINT64_V(hci_acl_tx_packets, PL011State, 3),
+        VMSTATE_UINT64_V(hci_acl_rx_packets, PL011State, 3),
         VMSTATE_END_OF_LIST()
     },
     .subsections = (const VMStateDescription * const []) {
@@ -640,6 +857,7 @@ static const VMStateDescription vmstate_pl011 = {
 static const Property pl011_properties[] = {
     DEFINE_PROP_CHR("chardev", PL011State, chr),
     DEFINE_PROP_BOOL("migrate-clk", PL011State, migrate_clk, true),
+    DEFINE_PROP_BOOL("hci-controller", PL011State, hci_controller, false),
 };
 
 static void pl011_init(Object *obj)
@@ -658,6 +876,16 @@ static void pl011_init(Object *obj)
                                 ClockUpdate);
 
     s->id = pl011_id_arm;
+    object_property_add_uint64_ptr(obj, "hci-commands", &s->hci_commands,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "hci-events", &s->hci_events,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "hci-acl-tx-packets",
+                                   &s->hci_acl_tx_packets,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "hci-acl-rx-packets",
+                                   &s->hci_acl_rx_packets,
+                                   OBJ_PROP_FLAG_READ);
 }
 
 static void pl011_realize(DeviceState *dev, Error **errp)
@@ -685,6 +913,16 @@ static void pl011_reset(DeviceState *dev)
     s->cr = 0x300;
     s->flags = 0;
     s->logged_disabled_uart = false;
+    s->hci_tx_size = 0;
+    s->hci_tx_expected = 0;
+    s->hci_rx_size = 0;
+    s->hci_rx_expected = 0;
+    s->hci_event_size = 0;
+    s->hci_event_offset = 0;
+    s->hci_commands = 0;
+    s->hci_events = 0;
+    s->hci_acl_tx_packets = 0;
+    s->hci_acl_rx_packets = 0;
     pl011_reset_rx_fifo(s);
     pl011_reset_tx_fifo(s);
 }
