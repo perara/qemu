@@ -41,7 +41,9 @@
 #include "system/block-backend.h"
 #include "hw/sd/sd.h"
 #include "migration/vmstate.h"
+#include "migration/qemu-file.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/bitmap.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -53,6 +55,7 @@
 #include "sdmmc-internal.h"
 #include "trace.h"
 #include "crypto/hmac.h"
+#include "net/net.h"
 
 //#define DEBUG_SD 1
 
@@ -140,6 +143,19 @@ typedef struct QEMU_PACKED {
 QEMU_BUILD_BUG_MSG(sizeof(RPMBDataFrame) != 512,
                    "invalid RPMBDataFrame size");
 
+typedef struct EMMCCacheEntry {
+    uint64_t addr;
+    uint64_t key;
+    uint8_t partition;
+    uint8_t data[512];
+} EMMCCacheEntry;
+
+typedef struct EMMCProgramEntry {
+    uint64_t addr;
+    uint8_t partition;
+    uint8_t data[512];
+} EMMCProgramEntry;
+
 struct SDState {
     DeviceState parent_obj;
 
@@ -164,7 +180,35 @@ struct SDState {
     uint8_t spec_version;
     uint64_t boot_part_size;
     uint64_t rpmb_part_size;
+    uint64_t cache_size;
+    uint32_t cache_capacity;
+    uint32_t cache_count;
+    bool cache_power_loss_on_reset;
+    uint64_t cache_flush_sector_delay_us;
+    uint64_t cache_flush_deadline_us;
+    uint64_t cache_flush_completed_sectors;
+    bool cache_flush_active;
+    EMMCCacheEntry *cache_entries;
+    GHashTable *cache_index;
+    QEMUTimer *cache_flush_timer;
+    uint64_t program_sector_delay_us;
+    uint64_t program_deadline_us;
+    uint64_t program_completed_sectors;
+    int32_t program_count;
+    bool program_active;
+    EMMCProgramEntry *program_entries;
+    QEMUTimer *program_timer;
+    uint64_t erase_group_delay_us;
+    uint64_t erase_next;
+    uint64_t erase_last;
+    uint64_t erase_deadline_us;
+    uint64_t erase_completed_groups;
+    uint8_t erase_partition;
+    bool erase_active;
+    QEMUTimer *erase_timer;
     BlockBackend *blk;
+    BlockBackend *boot_blk;
+    BlockBackend *rpmb_blk;
     uint8_t boot_config;
 
     const SDProto *proto;
@@ -179,6 +223,7 @@ struct SDState {
     uint64_t size;
     uint32_t blk_len;
     uint32_t multi_blk_cnt;
+    bool reliable_write;
     uint32_t erase_start;
     uint32_t erase_end;
     uint8_t pwd[16];
@@ -216,12 +261,87 @@ struct SDState {
     uint8_t dat_lines;
     bool cmd_line;
     char *preset_auth_key;
+    char *preset_cid;
+    uint8_t configured_cid[16];
+
+    /* CYW43455 SDIO transport state. */
+    uint8_t cyw_cccr[0x100];
+    uint8_t cyw_fbr[0x300];
+    uint8_t cyw_func1_regs[0x20];
+    uint8_t cyw_transfer[32768];
+    uint8_t cyw_rx_queue[32768];
+    uint32_t cyw_transfer_size;
+    uint32_t cyw_transfer_offset;
+    uint32_t cyw_transfer_address;
+    uint32_t cyw_ram_size;
+    uint8_t *cyw_ram;
+    uint16_t cyw_rca;
+    uint16_t cyw_block_size[3];
+    uint8_t cyw_function;
+    uint8_t cyw_fail_command;
+    bool cyw_selected;
+    bool cyw_transfer_write;
+    bool cyw_transfer_increment;
+    uint64_t cyw_command_count;
+    uint64_t cyw_fail_after;
+    uint64_t cyw_command_failures;
+    uint64_t cyw_firmware_bytes;
+    uint64_t cyw_tx_bytes;
+    uint64_t cyw_rx_bytes;
+    uint32_t cyw_core_ioctl[4];
+    uint32_t cyw_core_reset[4];
+    uint32_t cyw_armcr4_bankidx;
+    uint32_t cyw_reset_vector;
+    uint32_t cyw_nvram_size;
+    uint32_t cyw_shared_address;
+    uint32_t cyw_intstatus;
+    uint32_t cyw_hostintmask;
+    uint32_t cyw_tosbmailbox;
+    uint32_t cyw_tohostmailbox;
+    uint32_t cyw_tosbmailboxdata;
+    uint32_t cyw_tohostmailboxdata;
+    uint32_t cyw_rx_queue_size;
+    uint32_t cyw_rx_queue_offset;
+    uint64_t cyw_start_failures;
+    uint64_t cyw_control_requests;
+    uint64_t cyw_control_rejections;
+    uint64_t cyw_data_tx_packets;
+    uint64_t cyw_data_rx_packets;
+    uint8_t cyw_packet_drop_direction;
+    uint64_t cyw_packet_drop_after;
+    uint32_t cyw_packet_drop_count;
+    uint64_t cyw_packet_drop_packets_seen;
+    uint32_t cyw_packet_drops_injected;
+    uint8_t cyw_rx_sequence;
+    uint8_t cyw_tx_sequence_max;
+    bool cyw_reset_vector_valid;
+    bool cyw_firmware_started;
+    bool cyw_sdio_irq;
+    bool cyw_link_event_pending;
+    bool cyw_link_event_sent;
+    NICConf cyw_nic_conf;
+    NICState *cyw_nic;
+};
+
+enum {
+    CYW_PACKET_DROP_NONE,
+    CYW_PACKET_DROP_TX,
+    CYW_PACKET_DROP_RX,
+    CYW_PACKET_DROP_BOTH,
 };
 
 static void sd_realize(DeviceState *dev, Error **errp);
 
 static const SDProto sd_proto_spi;
 static const SDProto sd_proto_emmc;
+
+static bool sd_emmc_cache_flush(SDState *sd);
+static void sd_emmc_cache_drop(SDState *sd);
+static void sd_emmc_cache_flush_timer(void *opaque);
+static void sd_emmc_program_drop(SDState *sd);
+static void sd_emmc_program_timer(void *opaque);
+static void sd_emmc_erase_timer(void *opaque);
+static bool cyw_sdio_inject_packet_drop(SDState *sd, uint8_t direction);
 
 static bool sd_is_spi(SDState *sd)
 {
@@ -491,6 +611,11 @@ static void sd_set_cid(SDState *sd)
 
 static void emmc_set_cid(SDState *sd)
 {
+    if (sd->preset_cid) {
+        memcpy(sd->cid, sd->configured_cid, sizeof(sd->cid));
+        return;
+    }
+
     sd->cid[0] = MID;       /* Fake card manufacturer ID (MID) */
     sd->cid[1] = 0b01;      /* CBX: soldered BGA */
     sd->cid[2] = OID[0];    /* OEM/Application ID (OID) */
@@ -513,6 +638,7 @@ static void emmc_set_cid(SDState *sd)
 #define WPGROUP_SHIFT   7        /* 2 megs */
 #define CMULT_SHIFT     9        /* 512 times HWBLOCK_SIZE */
 #define WPGROUP_SIZE    (1 << (HWBLOCK_SHIFT + SECTOR_SHIFT + WPGROUP_SHIFT))
+#define EMMC_HC_ERASE_GROUP_BYTES (512 * KiB)
 
 static const uint8_t sd_csd_rw_mask[16] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -533,7 +659,9 @@ static void emmc_set_ext_csd(SDState *sd, uint64_t size)
     sd->ext_csd[EXT_CSD_ACC_SIZE] = 0x1; /* Access size */
     sd->ext_csd[EXT_CSD_HC_ERASE_GRP_SIZE] = 0x01; /* HC Erase unit size */
     sd->ext_csd[EXT_CSD_ERASE_TIMEOUT_MULT] = 0x01; /* HC erase timeout */
+    sd->ext_csd[EXT_CSD_ERASED_MEM_CONT] = 0x01; /* erased bytes read as 0xff */
     sd->ext_csd[EXT_CSD_REL_WR_SEC_C] = 0x1; /* Reliable write sector count */
+    sd->ext_csd[EXT_CSD_WR_REL_PARAM] = EXT_CSD_WR_REL_PARAM_EN;
     sd->ext_csd[EXT_CSD_HC_WP_GRP_SIZE] = 0x01; /* HC write protect group size */
     sd->ext_csd[EXT_CSD_S_C_VCC] = 0x01; /* Sleep current VCC  */
     sd->ext_csd[EXT_CSD_S_C_VCCQ] = 0x01; /* Sleep current VCCQ */
@@ -550,6 +678,7 @@ static void emmc_set_ext_csd(SDState *sd, uint64_t size)
     sd->ext_csd[EXT_CSD_REV] = 5;
     sd->ext_csd[EXT_CSD_RPMB_MULT] = sd->rpmb_part_size / (128 * KiB);
     sd->ext_csd[EXT_CSD_PARTITION_SUPPORT] = 0b111;
+    stl_le_p(&sd->ext_csd[EXT_CSD_CACHE_SIZE], sd->cache_size / KiB);
 
     /* Mode segment (RW) */
     sd->ext_csd[EXT_CSD_PART_CONFIG] = sd->boot_config;
@@ -874,33 +1003,69 @@ static uint32_t sd_blk_len(SDState *sd)
 }
 
 /*
- * This requires a disk image that has two boot partitions inserted at the
- * beginning of it, followed by an RPMB partition. The size of the boot
- * partitions is the "boot-partition-size" property, the one of the RPMB
- * partition is 'rpmb-partition-size'.
+ * The legacy layout places boot0, boot1, RPMB, then the user area in one
+ * backend.  Separate partition backends keep the user-area image at offset
+ * zero, which allows an unmodified image produced by Raspberry Pi Imager to
+ * be attached directly.
  */
-static uint32_t sd_part_offset(SDState *sd)
+static bool sd_has_separate_partitions(SDState *sd)
 {
-    unsigned partition_access;
+    return sd->boot_blk || sd->rpmb_blk;
+}
 
+static BlockBackend *sd_part_backend_for_access(SDState *sd,
+                                                unsigned partition_access,
+                                                uint64_t *offset)
+{
+    *offset = 0;
     if (!sd_is_emmc(sd)) {
-        return 0;
+        return sd->blk;
     }
 
-    partition_access = sd->ext_csd[EXT_CSD_PART_CONFIG]
-                                 & EXT_CSD_PART_CONFIG_ACC_MASK;
+    if (sd_has_separate_partitions(sd)) {
+        switch (partition_access) {
+        case EXT_CSD_PART_CONFIG_ACC_DEFAULT:
+            return sd->blk;
+        case EXT_CSD_PART_CONFIG_ACC_BOOT1:
+            return sd->boot_blk;
+        case EXT_CSD_PART_CONFIG_ACC_BOOT2:
+            *offset = sd->boot_part_size;
+            return sd->boot_blk;
+        case EXT_CSD_PART_CONFIG_ACC_RPMB:
+            return sd->rpmb_blk;
+        default:
+            g_assert_not_reached();
+        }
+    }
+
     switch (partition_access) {
     case EXT_CSD_PART_CONFIG_ACC_DEFAULT:
-        return sd->boot_part_size * 2 + sd->rpmb_part_size;
+        *offset = sd->boot_part_size * 2 + sd->rpmb_part_size;
+        break;
     case EXT_CSD_PART_CONFIG_ACC_BOOT1:
-        return 0;
+        break;
     case EXT_CSD_PART_CONFIG_ACC_BOOT2:
-        return sd->boot_part_size * 1;
+        *offset = sd->boot_part_size;
+        break;
     case EXT_CSD_PART_CONFIG_ACC_RPMB:
-        return sd->boot_part_size * 2;
+        *offset = sd->boot_part_size * 2;
+        break;
     default:
-         g_assert_not_reached();
+        g_assert_not_reached();
     }
+    return sd->blk;
+}
+
+static unsigned sd_current_partition(SDState *sd)
+{
+    return sd_is_emmc(sd) ?
+        sd->ext_csd[EXT_CSD_PART_CONFIG] & EXT_CSD_PART_CONFIG_ACC_MASK :
+        EXT_CSD_PART_CONFIG_ACC_DEFAULT;
+}
+
+static BlockBackend *sd_part_backend(SDState *sd, uint64_t *offset)
+{
+    return sd_part_backend_for_access(sd, sd_current_partition(sd), offset);
 }
 
 static uint64_t sd_req_get_address(SDState *sd, SDRequest req)
@@ -929,13 +1094,37 @@ static void sd_reset(DeviceState *dev)
     uint64_t sect;
 
     trace_sdcard_reset();
+    timer_del(sd->cache_flush_timer);
+    timer_del(sd->program_timer);
+    timer_del(sd->erase_timer);
+    sd->cache_flush_active = false;
+    sd->cache_flush_deadline_us = 0;
+    sd->cache_flush_completed_sectors = 0;
+    sd->program_active = false;
+    sd->program_deadline_us = 0;
+    sd->program_completed_sectors = 0;
+    sd_emmc_program_drop(sd);
+    sd->erase_active = false;
+    sd->erase_next = UINT64_MAX;
+    sd->erase_last = 0;
+    sd->erase_deadline_us = 0;
+    sd->erase_completed_groups = 0;
+    sd->erase_partition = 0;
+    if (sd_is_emmc(sd) && sd->cache_count) {
+        if (sd->cache_power_loss_on_reset) {
+            sd_emmc_cache_drop(sd);
+        } else if (!sd_emmc_cache_flush(sd)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "eMMC cache flush failed during reset\n");
+        }
+    }
     if (sd->blk) {
         blk_get_geometry(sd->blk, &sect);
     } else {
         sect = 0;
     }
     size = sect << HWBLOCK_SHIFT;
-    if (sd_is_emmc(sd)) {
+    if (sd_is_emmc(sd) && !sd_has_separate_partitions(sd)) {
         size -= sd->boot_part_size * 2 + sd->rpmb_part_size;
     }
 
@@ -966,6 +1155,7 @@ static void sd_reset(DeviceState *dev)
     sd->dat_lines = 0xf;
     sd->cmd_line = true;
     sd->multi_blk_cnt = 0;
+    sd->reliable_write = false;
 }
 
 static bool sd_get_inserted(SDState *sd)
@@ -1004,6 +1194,9 @@ static const BlockDevOps sd_block_ops = {
     .change_media_cb = sd_cardchange,
 };
 
+static const BlockDevOps emmc_block_ops = {
+};
+
 static bool sd_ocr_vmstate_needed(void *opaque)
 {
     SDState *sd = opaque;
@@ -1032,7 +1225,7 @@ static bool vmstate_needed_for_rpmb(void *opaque)
 }
 
 static const VMStateDescription emmc_rpmb_vmstate = {
-    .name = "sd-card/ext_csd_modes-state",
+    .name = "sd-card/rpmb-state",
     .version_id = 1,
     .minimum_version_id = 1,
     .needed = vmstate_needed_for_rpmb,
@@ -1070,6 +1263,260 @@ static const VMStateDescription emmc_extcsd_vmstate = {
     },
 };
 
+static const VMStateDescription emmc_cache_entry_vmstate = {
+    .name = "sd-card/emmc-cache-entry",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(addr, EMMCCacheEntry),
+        VMSTATE_UINT8(partition, EMMCCacheEntry),
+        VMSTATE_UINT8_ARRAY(data, EMMCCacheEntry, 512),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool vmstate_needed_for_emmc_cache(void *opaque)
+{
+    SDState *sd = opaque;
+
+    return sd_is_emmc(sd) &&
+           (sd->cache_count || sd->cache_flush_active);
+}
+
+static void sd_emmc_cache_rebuild_index(SDState *sd)
+{
+    g_hash_table_remove_all(sd->cache_index);
+    for (uint32_t i = 0; i < sd->cache_count; i++) {
+        EMMCCacheEntry *entry = &sd->cache_entries[i];
+
+        entry->key = (entry->addr >> HWBLOCK_SHIFT) |
+                     ((uint64_t)entry->partition << 56);
+        g_hash_table_insert(sd->cache_index, &entry->key,
+                            GUINT_TO_POINTER(i + 1));
+    }
+}
+
+/*
+ * The entry arrays are decoded straight after their counts, so a count that
+ * post_load would have rejected has already been used to size the decode.
+ * Validate both counts as they are read instead, while keeping the wire
+ * format identical to the plain integer fields they replace.
+ */
+static int get_emmc_cache_count(QEMUFile *f, void *pv, size_t size,
+                                const VMStateField *field)
+{
+    SDState *sd = container_of(pv, SDState, cache_count);
+    uint32_t value = qemu_get_be32(f);
+
+    if (value > sd->cache_capacity) {
+        return -EINVAL;
+    }
+    sd->cache_count = value;
+    return 0;
+}
+
+static int put_emmc_cache_count(QEMUFile *f, void *pv, size_t size,
+                                const VMStateField *field,
+                                JSONWriter *vmdesc)
+{
+    qemu_put_be32(f, *(uint32_t *)pv);
+    return 0;
+}
+
+static const VMStateInfo vmstate_info_emmc_cache_count = {
+    .name = "sd-card/emmc-cache-count",
+    .get = get_emmc_cache_count,
+    .put = put_emmc_cache_count,
+};
+
+static int get_emmc_program_count(QEMUFile *f, void *pv, size_t size,
+                                  const VMStateField *field)
+{
+    int32_t value = qemu_get_be32(f);
+
+    if (value < 0 || value > UINT16_MAX) {
+        return -EINVAL;
+    }
+    *(int32_t *)pv = value;
+    return 0;
+}
+
+static int put_emmc_program_count(QEMUFile *f, void *pv, size_t size,
+                                  const VMStateField *field,
+                                  JSONWriter *vmdesc)
+{
+    qemu_put_be32(f, *(int32_t *)pv);
+    return 0;
+}
+
+static const VMStateInfo vmstate_info_emmc_program_count = {
+    .name = "sd-card/emmc-program-count",
+    .get = get_emmc_program_count,
+    .put = put_emmc_program_count,
+};
+
+static int emmc_cache_post_load(void *opaque, int version_id)
+{
+    SDState *sd = opaque;
+
+    if (version_id < 2) {
+        sd->cache_flush_active = false;
+        sd->cache_flush_deadline_us = 0;
+        sd->cache_flush_completed_sectors = 0;
+        timer_del(sd->cache_flush_timer);
+    }
+    if (!sd->cache_index || sd->cache_count > sd->cache_capacity) {
+        return -EINVAL;
+    }
+    if (sd->cache_flush_active &&
+        (!sd->cache_count || !sd->cache_flush_sector_delay_us ||
+         !timer_pending(sd->cache_flush_timer))) {
+        return -EINVAL;
+    }
+    for (uint32_t i = 0; i < sd->cache_count; i++) {
+        if (sd->cache_entries[i].partition >
+            EXT_CSD_PART_CONFIG_ACC_RPMB) {
+            return -EINVAL;
+        }
+    }
+    sd_emmc_cache_rebuild_index(sd);
+    return 0;
+}
+
+static const VMStateDescription emmc_cache_vmstate = {
+    .name = "sd-card/emmc-cache-state",
+    .version_id = 2,
+    .minimum_version_id = 1,
+    .needed = vmstate_needed_for_emmc_cache,
+    .post_load = emmc_cache_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64_EQUAL(cache_size, SDState),
+        {
+            .name = "cache_count",
+            .version_id = 0,
+            .size = sizeof(uint32_t),
+            .info = &vmstate_info_emmc_cache_count,
+            .flags = VMS_SINGLE,
+            .offset = offsetof(SDState, cache_count),
+        },
+        VMSTATE_STRUCT_VARRAY_POINTER_UINT32(
+            cache_entries, SDState, cache_count,
+            emmc_cache_entry_vmstate, EMMCCacheEntry),
+        VMSTATE_UINT64_EQUAL_V(cache_flush_sector_delay_us, SDState, 2),
+        VMSTATE_UINT64_V(cache_flush_deadline_us, SDState, 2),
+        VMSTATE_UINT64_V(cache_flush_completed_sectors, SDState, 2),
+        VMSTATE_BOOL_V(cache_flush_active, SDState, 2),
+        VMSTATE_TIMER_PTR_V(cache_flush_timer, SDState, 2),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription emmc_program_entry_vmstate = {
+    .name = "sd-card/emmc-program-entry",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(addr, EMMCProgramEntry),
+        VMSTATE_UINT8(partition, EMMCProgramEntry),
+        VMSTATE_UINT8_ARRAY(data, EMMCProgramEntry, 512),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool vmstate_needed_for_emmc_program(void *opaque)
+{
+    SDState *sd = opaque;
+
+    return sd_is_emmc(sd) && (sd->program_count || sd->program_active);
+}
+
+static int emmc_program_post_load(void *opaque, int version_id)
+{
+    SDState *sd = opaque;
+
+    if (sd->program_count < 0 || sd->program_count > UINT16_MAX ||
+        (sd->program_active &&
+         (!sd->program_count || !sd->program_sector_delay_us ||
+          !timer_pending(sd->program_timer)))) {
+        return -EINVAL;
+    }
+    for (uint32_t i = 0; i < sd->program_count; i++) {
+        if (sd->program_entries[i].partition >
+            EXT_CSD_PART_CONFIG_ACC_RPMB) {
+            return -EINVAL;
+        }
+    }
+    return 0;
+}
+
+static const VMStateDescription emmc_program_vmstate = {
+    .name = "sd-card/emmc-program-state",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = vmstate_needed_for_emmc_program,
+    .post_load = emmc_program_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64_EQUAL(program_sector_delay_us, SDState),
+        VMSTATE_UINT64(program_deadline_us, SDState),
+        VMSTATE_UINT64(program_completed_sectors, SDState),
+        {
+            .name = "program_count",
+            .version_id = 0,
+            .size = sizeof(int32_t),
+            .info = &vmstate_info_emmc_program_count,
+            .flags = VMS_SINGLE,
+            .offset = offsetof(SDState, program_count),
+        },
+        VMSTATE_STRUCT_VARRAY_ALLOC(
+            program_entries, SDState, program_count, 1,
+            emmc_program_entry_vmstate, EMMCProgramEntry),
+        VMSTATE_BOOL(program_active, SDState),
+        VMSTATE_TIMER_PTR(program_timer, SDState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool vmstate_needed_for_emmc_erase(void *opaque)
+{
+    SDState *sd = opaque;
+
+    return sd_is_emmc(sd) &&
+           (sd->erase_active || sd->erase_next != UINT64_MAX);
+}
+
+static int emmc_erase_post_load(void *opaque, int version_id)
+{
+    SDState *sd = opaque;
+
+    if (sd->erase_next == UINT64_MAX || sd->erase_next > sd->erase_last ||
+        sd->erase_partition >= EXT_CSD_PART_CONFIG_ACC_RPMB ||
+        (sd->erase_active &&
+         (!sd->erase_group_delay_us ||
+          !timer_pending(sd->erase_timer)))) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static const VMStateDescription emmc_erase_vmstate = {
+    .name = "sd-card/emmc-erase-state",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = vmstate_needed_for_emmc_erase,
+    .post_load = emmc_erase_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64_EQUAL(erase_group_delay_us, SDState),
+        VMSTATE_UINT64(erase_next, SDState),
+        VMSTATE_UINT64(erase_last, SDState),
+        VMSTATE_UINT64(erase_deadline_us, SDState),
+        VMSTATE_UINT64(erase_completed_groups, SDState),
+        VMSTATE_UINT8(erase_partition, SDState),
+        VMSTATE_BOOL(erase_active, SDState),
+        VMSTATE_TIMER_PTR(erase_timer, SDState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static int sd_vmstate_pre_load(void *opaque)
 {
     SDState *sd = opaque;
@@ -1085,7 +1532,7 @@ static int sd_vmstate_pre_load(void *opaque)
 
 static const VMStateDescription sd_vmstate = {
     .name = "sd-card",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 2,
     .pre_load = sd_vmstate_pre_load,
     .fields = (const VMStateField[]) {
@@ -1100,6 +1547,7 @@ static const VMStateDescription sd_vmstate = {
         VMSTATE_BITMAP(wp_group_bmap, SDState, 0, wp_group_bits),
         VMSTATE_UINT32(blk_len, SDState),
         VMSTATE_UINT32(multi_blk_cnt, SDState),
+        VMSTATE_BOOL_V(reliable_write, SDState, 3),
         VMSTATE_UINT32(erase_start, SDState),
         VMSTATE_UINT32(erase_end, SDState),
         VMSTATE_UINT8_ARRAY(pwd, SDState, 16),
@@ -1119,25 +1567,356 @@ static const VMStateDescription sd_vmstate = {
         &sd_ocr_vmstate,
         &emmc_extcsd_vmstate,
         &emmc_rpmb_vmstate,
+        &emmc_cache_vmstate,
+        &emmc_program_vmstate,
+        &emmc_erase_vmstate,
         NULL
     },
 };
 
+static int sd_partition_pread(SDState *sd, uint64_t addr, uint64_t len,
+                              void *buf)
+{
+    uint64_t offset;
+    BlockBackend *blk = sd_part_backend(sd, &offset);
+
+    return blk ? blk_pread(blk, addr + offset, len, buf, 0) : -ENOMEDIUM;
+}
+
+static int sd_partition_pwrite(SDState *sd, uint64_t addr, uint64_t len,
+                               const void *buf)
+{
+    uint64_t offset;
+    BlockBackend *blk = sd_part_backend(sd, &offset);
+
+    return blk ? blk_pwrite(blk, addr + offset, len, buf, 0) : -ENOMEDIUM;
+}
+
+static void sd_emmc_cache_drop(SDState *sd)
+{
+    sd->cache_count = 0;
+    if (sd->cache_index) {
+        g_hash_table_remove_all(sd->cache_index);
+    }
+}
+
+static bool sd_emmc_cache_commit_first(SDState *sd)
+{
+    EMMCCacheEntry *entry;
+    uint64_t offset;
+    BlockBackend *blk;
+
+    if (!sd->cache_count) {
+        return true;
+    }
+    entry = &sd->cache_entries[0];
+    blk = sd_part_backend_for_access(sd, entry->partition, &offset);
+    if (!blk ||
+        blk_pwrite(blk, entry->addr + offset, sizeof(entry->data),
+                   entry->data, 0) < 0 ||
+        blk_flush(blk) < 0) {
+        return false;
+    }
+
+    sd->cache_count--;
+    if (sd->cache_count) {
+        memmove(sd->cache_entries, sd->cache_entries + 1,
+                sd->cache_count * sizeof(*sd->cache_entries));
+    }
+    sd_emmc_cache_rebuild_index(sd);
+    return true;
+}
+
+static void sd_emmc_cache_flush_timer(void *opaque)
+{
+    SDState *sd = opaque;
+
+    if (!sd->cache_flush_active) {
+        return;
+    }
+    if (!sd_emmc_cache_commit_first(sd)) {
+        sd->card_status |= R_CSR_ERROR_MASK;
+        sd->cache_flush_active = false;
+        sd->cache_flush_deadline_us = 0;
+        sd->state = sd_transfer_state;
+        return;
+    }
+
+    sd->cache_flush_completed_sectors++;
+    if (!sd->cache_count) {
+        sd->cache_flush_active = false;
+        sd->cache_flush_deadline_us = 0;
+        sd->state = sd_transfer_state;
+        return;
+    }
+
+    sd->cache_flush_deadline_us += sd->cache_flush_sector_delay_us;
+    timer_mod(sd->cache_flush_timer, sd->cache_flush_deadline_us);
+}
+
+static bool sd_emmc_cache_flush(SDState *sd)
+{
+    uint32_t completed = 0;
+    bool flush_user = false;
+    bool flush_boot = false;
+    bool flush_rpmb = false;
+
+    if (!sd->cache_count) {
+        uint64_t offset;
+        BlockBackend *blk = sd_part_backend(sd, &offset);
+
+        flush_user = blk == sd->blk;
+        flush_boot = blk == sd->boot_blk;
+        flush_rpmb = blk == sd->rpmb_blk;
+    }
+
+    for (; completed < sd->cache_count; completed++) {
+        EMMCCacheEntry *entry = &sd->cache_entries[completed];
+        uint64_t offset;
+        BlockBackend *blk = sd_part_backend_for_access(
+            sd, entry->partition, &offset);
+
+        if (!blk ||
+            blk_pwrite(blk, entry->addr + offset, sizeof(entry->data),
+                       entry->data, 0) < 0) {
+            break;
+        }
+        flush_user |= blk == sd->blk;
+        flush_boot |= blk == sd->boot_blk;
+        flush_rpmb |= blk == sd->rpmb_blk;
+    }
+
+    if (completed != sd->cache_count) {
+        bool completed_durable =
+            (!flush_user || blk_flush(sd->blk) == 0) &&
+            (!flush_boot || blk_flush(sd->boot_blk) == 0) &&
+            (!flush_rpmb || blk_flush(sd->rpmb_blk) == 0);
+
+        if (completed && completed_durable) {
+            memmove(sd->cache_entries, sd->cache_entries + completed,
+                    (sd->cache_count - completed) *
+                    sizeof(*sd->cache_entries));
+            sd->cache_count -= completed;
+            sd_emmc_cache_rebuild_index(sd);
+        }
+        return false;
+    }
+
+    if ((flush_user && blk_flush(sd->blk) < 0) ||
+        (flush_boot && blk_flush(sd->boot_blk) < 0) ||
+        (flush_rpmb && blk_flush(sd->rpmb_blk) < 0)) {
+        return false;
+    }
+
+    sd_emmc_cache_drop(sd);
+    return true;
+}
+
+static void sd_emmc_program_drop(SDState *sd)
+{
+    g_clear_pointer(&sd->program_entries, g_free);
+    sd->program_count = 0;
+}
+
+static EMMCProgramEntry *sd_emmc_program_lookup(SDState *sd, uint64_t addr,
+                                                unsigned int partition)
+{
+    for (uint32_t i = 0; i < sd->program_count; i++) {
+        EMMCProgramEntry *entry = &sd->program_entries[i];
+
+        if (entry->addr == addr && entry->partition == partition) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static void sd_emmc_program_timer(void *opaque)
+{
+    SDState *sd = opaque;
+    EMMCProgramEntry *entry;
+    uint64_t offset;
+    BlockBackend *blk;
+
+    if (!sd->program_active || !sd->program_count) {
+        return;
+    }
+    entry = &sd->program_entries[0];
+    blk = sd_part_backend_for_access(sd, entry->partition, &offset);
+    if (!blk ||
+        blk_pwrite(blk, entry->addr + offset, sizeof(entry->data),
+                   entry->data, 0) < 0 ||
+        blk_flush(blk) < 0) {
+        sd->card_status |= R_CSR_ERROR_MASK;
+        sd->program_active = false;
+        sd->program_deadline_us = 0;
+        if (sd->state == sd_programming_state) {
+            sd->state = sd_transfer_state;
+        }
+        return;
+    }
+
+    sd->program_count--;
+    if (sd->program_count) {
+        memmove(sd->program_entries, sd->program_entries + 1,
+                sd->program_count * sizeof(*sd->program_entries));
+    } else {
+        g_clear_pointer(&sd->program_entries, g_free);
+    }
+    sd->program_completed_sectors++;
+    if (!sd->program_count) {
+        sd->program_active = false;
+        sd->program_deadline_us = 0;
+        if (sd->state == sd_programming_state) {
+            sd->state = sd_transfer_state;
+        }
+        return;
+    }
+
+    sd->program_deadline_us += sd->program_sector_delay_us;
+    timer_mod(sd->program_timer, sd->program_deadline_us);
+}
+
+static bool sd_emmc_program_write(SDState *sd, uint64_t addr, uint32_t len,
+                                  const void *buf)
+{
+    unsigned int partition;
+    EMMCProgramEntry *entry;
+    bool new_transaction;
+
+    if (!sd_is_emmc(sd) || !sd->program_sector_delay_us ||
+        len != sizeof(entry->data) ||
+        !QEMU_IS_ALIGNED(addr, sizeof(entry->data))) {
+        return false;
+    }
+    partition = sd_current_partition(sd);
+    if (partition == EXT_CSD_PART_CONFIG_ACC_RPMB) {
+        return false;
+    }
+
+    entry = sd_emmc_program_lookup(sd, addr, partition);
+    if (!entry) {
+        if (sd->program_count == UINT16_MAX) {
+            sd->card_status |= R_CSR_ERROR_MASK;
+            return true;
+        }
+        new_transaction = !sd->program_count;
+        sd->program_entries = g_renew(
+            EMMCProgramEntry, sd->program_entries, sd->program_count + 1);
+        entry = &sd->program_entries[sd->program_count++];
+        entry->addr = addr;
+        entry->partition = partition;
+        if (new_transaction) {
+            sd->program_completed_sectors = 0;
+        }
+    }
+    memcpy(entry->data, buf, sizeof(entry->data));
+
+    if (!sd->program_active) {
+        sd->program_active = true;
+        sd->program_deadline_us =
+            qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) +
+            sd->program_sector_delay_us;
+        timer_mod(sd->program_timer, sd->program_deadline_us);
+    }
+    return true;
+}
+
+static bool sd_emmc_cache_enabled(SDState *sd)
+{
+    return sd_is_emmc(sd) && sd->cache_capacity &&
+           (sd->ext_csd[EXT_CSD_CACHE_CTRL] & 1);
+}
+
+static EMMCCacheEntry *sd_emmc_cache_lookup(SDState *sd, uint64_t addr,
+                                            unsigned partition)
+{
+    uint64_t key = (addr >> HWBLOCK_SHIFT) |
+                   ((uint64_t)partition << 56);
+    gpointer value;
+
+    if (!sd->cache_index) {
+        return NULL;
+    }
+    value = g_hash_table_lookup(sd->cache_index, &key);
+    return value ? &sd->cache_entries[GPOINTER_TO_UINT(value) - 1] : NULL;
+}
+
+static bool sd_emmc_cache_write(SDState *sd, uint64_t addr, uint32_t len,
+                                const void *buf)
+{
+    unsigned partition = sd_current_partition(sd);
+    EMMCCacheEntry *entry;
+
+    if (sd->reliable_write || !sd_emmc_cache_enabled(sd) ||
+        len != sizeof(entry->data) ||
+        !QEMU_IS_ALIGNED(addr, sizeof(entry->data)) ||
+        partition == EXT_CSD_PART_CONFIG_ACC_RPMB) {
+        return false;
+    }
+
+    entry = sd_emmc_cache_lookup(sd, addr, partition);
+    if (!entry) {
+        if (sd->cache_count == sd->cache_capacity &&
+            !sd_emmc_cache_flush(sd)) {
+            sd->card_status |= R_CSR_ERROR_MASK;
+            return true;
+        }
+        entry = &sd->cache_entries[sd->cache_count++];
+        entry->addr = addr;
+        entry->partition = partition;
+        entry->key = (addr >> HWBLOCK_SHIFT) |
+                     ((uint64_t)partition << 56);
+        g_hash_table_insert(sd->cache_index, &entry->key,
+                            GUINT_TO_POINTER(sd->cache_count));
+    }
+    memcpy(entry->data, buf, sizeof(entry->data));
+    return true;
+}
+
 static void sd_blk_read(SDState *sd, uint64_t addr, uint32_t len)
 {
+    EMMCCacheEntry *entry;
+    EMMCProgramEntry *program_entry;
+
     trace_sdcard_read_block(addr, len);
-    addr += sd_part_offset(sd);
-    if (!sd->blk || blk_pread(sd->blk, addr, len, sd->data, 0) < 0) {
+    if (sd_partition_pread(sd, addr, len, sd->data) < 0) {
         fprintf(stderr, "sd_blk_read: read error on host side\n");
+    }
+    entry = sd_emmc_cache_lookup(sd, addr, sd_current_partition(sd));
+    if (entry && len <= sizeof(entry->data)) {
+        memcpy(sd->data, entry->data, len);
+    }
+    program_entry = sd_emmc_program_lookup(
+        sd, addr, sd_current_partition(sd));
+    if (program_entry && len <= sizeof(program_entry->data)) {
+        memcpy(sd->data, program_entry->data, len);
     }
 }
 
 static void sd_blk_write(SDState *sd, uint64_t addr, uint32_t len)
 {
+    uint64_t offset;
+    BlockBackend *blk;
+
     trace_sdcard_write_block(addr, len);
-    addr += sd_part_offset(sd);
-    if (!sd->blk || blk_pwrite(sd->blk, addr, len, sd->data, 0) < 0) {
+    if (sd_emmc_cache_write(sd, addr, len, sd->data)) {
+        return;
+    }
+    if (sd_emmc_program_write(sd, addr, len, sd->data)) {
+        return;
+    }
+    if (sd_partition_pwrite(sd, addr, len, sd->data) < 0) {
         fprintf(stderr, "sd_blk_write: write error on host side\n");
+        return;
+    }
+    if (sd->reliable_write) {
+        blk = sd_part_backend(sd, &offset);
+        if (!blk || blk_flush(blk) < 0) {
+            sd->card_status |= R_CSR_ERROR_MASK;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "eMMC reliable write flush failed\n");
+        }
     }
 }
 
@@ -1179,9 +1958,9 @@ static bool rpmb_calc_hmac(SDState *sd, const RPMBDataFrame *frame,
                (uint8_t *)frame + offsetof(RPMBDataFrame, nonce),
                RPMB_HASH_LEN - RPMB_DATA_LEN);
 
-        offset = lduw_be_p(&frame->address) * RPMB_DATA_LEN + sd_part_offset(sd);
+        offset = lduw_be_p(&frame->address) * RPMB_DATA_LEN;
         do {
-            if (blk_pread(sd->blk, offset, RPMB_DATA_LEN, buf, 0) < 0) {
+            if (sd_partition_pread(sd, offset, RPMB_DATA_LEN, buf) < 0) {
                 error_report("sd_blk_read: read error on host side");
                 success = false;
                 break;
@@ -1222,9 +2001,9 @@ static void emmc_rpmb_blk_read(SDState *sd, uint64_t addr, uint32_t len)
             curr_block += lduw_be_p(&sd->rpmb.result.block_count);
             curr_block -= sd->multi_blk_cnt;
         }
-        addr = curr_block * RPMB_DATA_LEN + sd_part_offset(sd);
-        if (blk_pread(sd->blk, addr, RPMB_DATA_LEN,
-                      sd->rpmb.result.data, 0) < 0) {
+        addr = curr_block * RPMB_DATA_LEN;
+        if (sd_partition_pread(sd, addr, RPMB_DATA_LEN,
+                               sd->rpmb.result.data) < 0) {
             error_report("sd_blk_read: read error on host side");
             memset(sd->rpmb.result.data, 0, sizeof(sd->rpmb.result.data));
             stw_be_p(&sd->rpmb.result.result,
@@ -1301,8 +2080,8 @@ static void emmc_rpmb_blk_write(SDState *sd, uint64_t addr, uint32_t len)
             break;
         }
         sd->rpmb.result.address = frame->address;
-        addr = lduw_be_p(&frame->address) * RPMB_DATA_LEN + sd_part_offset(sd);
-        if (blk_pwrite(sd->blk, addr, RPMB_DATA_LEN, frame->data, 0) < 0) {
+        addr = lduw_be_p(&frame->address) * RPMB_DATA_LEN;
+        if (sd_partition_pwrite(sd, addr, RPMB_DATA_LEN, frame->data) < 0) {
             error_report("sd_blk_write: write error on host side");
             stw_be_p(&sd->rpmb.result.result, RPMB_RESULT_WRITE_FAILURE);
         } else {
@@ -1326,22 +2105,101 @@ exit:
     trace_sdcard_rpmb_write_block(req, lduw_be_p(&sd->rpmb.result.result));
 }
 
-static void sd_erase(SDState *sd)
+static void sd_emmc_cache_remove_range(SDState *sd, unsigned int partition,
+                                       uint64_t start, uint64_t end)
+{
+    uint32_t keep = 0;
+
+    for (uint32_t i = 0; i < sd->cache_count; i++) {
+        EMMCCacheEntry *entry = &sd->cache_entries[i];
+        bool overlaps = entry->partition == partition &&
+                        entry->addr < end &&
+                        entry->addr + sizeof(entry->data) > start;
+
+        if (!overlaps) {
+            if (keep != i) {
+                sd->cache_entries[keep] = *entry;
+            }
+            keep++;
+        }
+    }
+    if (keep != sd->cache_count) {
+        sd->cache_count = keep;
+        sd_emmc_cache_rebuild_index(sd);
+    }
+}
+
+static bool sd_emmc_erase_current_group(SDState *sd)
+{
+    g_autofree uint8_t *erased = NULL;
+    uint64_t offset;
+    uint64_t length;
+    BlockBackend *blk;
+
+    if (sd->erase_next >= sd->erase_last) {
+        return true;
+    }
+    length = MIN(EMMC_HC_ERASE_GROUP_BYTES,
+                 sd->erase_last - sd->erase_next);
+    erased = g_malloc(length);
+    memset(erased, 0xff, length);
+    blk = sd_part_backend_for_access(sd, sd->erase_partition, &offset);
+    if (!blk ||
+        blk_pwrite(blk, sd->erase_next + offset, length, erased, 0) < 0 ||
+        blk_flush(blk) < 0) {
+        return false;
+    }
+
+    sd->erase_next += length;
+    sd->erase_completed_groups++;
+    return true;
+}
+
+static void sd_emmc_erase_timer(void *opaque)
+{
+    SDState *sd = opaque;
+
+    if (!sd->erase_active) {
+        return;
+    }
+    if (!sd_emmc_erase_current_group(sd)) {
+        sd->card_status |= R_CSR_ERROR_MASK;
+        sd->erase_active = false;
+        sd->erase_deadline_us = 0;
+        sd->state = sd_transfer_state;
+        return;
+    }
+    if (sd->erase_next >= sd->erase_last) {
+        sd->erase_active = false;
+        sd->erase_next = UINT64_MAX;
+        sd->erase_last = 0;
+        sd->erase_deadline_us = 0;
+        sd->state = sd_transfer_state;
+        return;
+    }
+
+    sd->erase_deadline_us += sd->erase_group_delay_us;
+    timer_mod(sd->erase_timer, sd->erase_deadline_us);
+}
+
+static bool sd_erase(SDState *sd)
 {
     uint64_t erase_start = sd->erase_start;
     uint64_t erase_end = sd->erase_end;
+    unsigned int partition;
     bool sdsc = true;
     uint64_t wpnum;
     uint64_t erase_addr;
     int erase_len = 1 << HWBLOCK_SHIFT;
 
     trace_sdcard_erase(sd->erase_start, sd->erase_end);
-    if (sd->erase_start == INVALID_ADDRESS
-            || sd->erase_end == INVALID_ADDRESS) {
+    if (sd->erase_start == INVALID_ADDRESS ||
+        sd->erase_end == INVALID_ADDRESS ||
+        sd->erase_start > sd->erase_end) {
         sd->card_status |= ERASE_SEQ_ERROR;
         sd->erase_start = INVALID_ADDRESS;
         sd->erase_end = INVALID_ADDRESS;
-        return;
+        return false;
     }
 
     if (FIELD_EX32(sd->ocr, OCR, CARD_CAPACITY)) {
@@ -1351,16 +2209,50 @@ static void sd_erase(SDState *sd)
         sdsc = false;
     }
 
-    if (erase_start > sd->size || erase_end > sd->size) {
+    if (erase_start >= sd->size || erase_end >= sd->size) {
         sd->card_status |= OUT_OF_RANGE;
         sd->erase_start = INVALID_ADDRESS;
         sd->erase_end = INVALID_ADDRESS;
-        return;
+        return false;
     }
 
     sd->erase_start = INVALID_ADDRESS;
     sd->erase_end = INVALID_ADDRESS;
     sd->csd[14] |= 0x40;
+
+    if (sd_is_emmc(sd)) {
+        partition = sd_current_partition(sd);
+        if (partition == EXT_CSD_PART_CONFIG_ACC_RPMB ||
+            sd->program_count) {
+            sd->card_status |= ERASE_SEQ_ERROR;
+            return false;
+        }
+
+        sd_emmc_cache_remove_range(sd, partition, erase_start,
+                                   erase_end + erase_len);
+        sd->erase_next = erase_start;
+        sd->erase_last = erase_end + erase_len;
+        sd->erase_partition = partition;
+        sd->erase_completed_groups = 0;
+        if (sd->erase_group_delay_us) {
+            sd->erase_active = true;
+            sd->erase_deadline_us =
+                qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) +
+                sd->erase_group_delay_us;
+            timer_mod(sd->erase_timer, sd->erase_deadline_us);
+            return true;
+        }
+
+        while (sd->erase_next < sd->erase_last) {
+            if (!sd_emmc_erase_current_group(sd)) {
+                sd->card_status |= R_CSR_ERROR_MASK;
+                return false;
+            }
+        }
+        sd->erase_next = UINT64_MAX;
+        sd->erase_last = 0;
+        return false;
+    }
 
     memset(sd->data, 0xff, erase_len);
     for (erase_addr = erase_start; erase_addr <= erase_end;
@@ -1376,6 +2268,7 @@ static void sd_erase(SDState *sd)
         }
         sd_blk_write(sd, erase_addr, erase_len);
     }
+    return false;
 }
 
 static uint32_t sd_wpbits(SDState *sd, uint64_t addr)
@@ -1424,6 +2317,24 @@ static void emmc_function_switch(SDState *sd, uint32_t arg)
         return;
     }
 
+    if (index == EXT_CSD_FLUSH_CACHE) {
+        if (access != EXT_CSD_ACCESS_MODE_WRITE_BYTE || value != 1) {
+            sd->card_status |= R_CSR_SWITCH_ERROR_MASK;
+        } else if (sd->cache_flush_sector_delay_us && sd->cache_count) {
+            sd->cache_flush_active = true;
+            sd->cache_flush_completed_sectors = 0;
+            sd->cache_flush_deadline_us =
+                qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) +
+                sd->cache_flush_sector_delay_us;
+            timer_mod(sd->cache_flush_timer,
+                      sd->cache_flush_deadline_us);
+        } else if (!sd_emmc_cache_flush(sd)) {
+            sd->card_status |= R_CSR_SWITCH_ERROR_MASK;
+        }
+        sd->ext_csd[index] = 0;
+        return;
+    }
+
     switch (access) {
     case EXT_CSD_ACCESS_MODE_COMMAND_SET:
         qemu_log_mask(LOG_UNIMP, "MMC Command set switching not supported\n");
@@ -1437,6 +2348,17 @@ static void emmc_function_switch(SDState *sd, uint32_t arg)
     case EXT_CSD_ACCESS_MODE_WRITE_BYTE:
         b = value;
         break;
+    }
+
+    if (index == EXT_CSD_CACHE_CTRL) {
+        if ((b & ~1) || ((b & 1) && !sd->cache_capacity)) {
+            sd->card_status |= R_CSR_SWITCH_ERROR_MASK;
+            return;
+        }
+        if (!(b & 1) && sd->cache_count && !sd_emmc_cache_flush(sd)) {
+            sd->card_status |= R_CSR_SWITCH_ERROR_MASK;
+            return;
+        }
     }
 
     if (index == EXT_CSD_PART_CONFIG) {
@@ -1771,7 +2693,9 @@ static sd_rsp_type_t emmc_cmd_SWITCH(SDState *sd, SDRequest req)
     case sd_transfer_state:
         sd->state = sd_programming_state;
         emmc_function_switch(sd, req.arg);
-        sd->state = sd_transfer_state;
+        if (!sd->cache_flush_active) {
+            sd->state = sd_transfer_state;
+        }
         return sd_r1b;
     default:
         return sd_invalid_state_for_cmd(sd, req);
@@ -1901,6 +2825,9 @@ static sd_rsp_type_t sd_cmd_SEND_CID(SDState *sd, SDRequest req)
 /* CMD12 */
 static sd_rsp_type_t sd_cmd_STOP_TRANSMISSION(SDState *sd, SDRequest req)
 {
+    sd->multi_blk_cnt = 0;
+    sd->reliable_write = false;
+
     switch (sd->state) {
     case sd_sendingdata_state:
         sd->state = sd_transfer_state;
@@ -1908,7 +2835,9 @@ static sd_rsp_type_t sd_cmd_STOP_TRANSMISSION(SDState *sd, SDRequest req)
     case sd_receivingdata_state:
         sd->state = sd_programming_state;
         /* Bzzzzzzztt .... Operation complete.  */
-        sd->state = sd_transfer_state;
+        if (!sd->program_count) {
+            sd->state = sd_transfer_state;
+        }
         return sd_r1;
     default:
         return sd_invalid_state_for_cmd(sd, req);
@@ -2023,8 +2952,10 @@ static sd_rsp_type_t sd_cmd_SET_BLOCK_COUNT(SDState *sd, SDRequest req)
     }
 
     sd->multi_blk_cnt = req.arg;
+    sd->reliable_write = false;
     if (sd_is_emmc(sd)) {
         sd->multi_blk_cnt &= 0xffff;
+        sd->reliable_write = sd->multi_blk_cnt && (req.arg & BIT(31));
     }
     trace_sdcard_set_block_count(sd->multi_blk_cnt);
 
@@ -2167,7 +3098,9 @@ static sd_rsp_type_t sd_cmd_ERASE(SDState *sd, SDRequest req)
     }
 
     sd->state = sd_programming_state;
-    sd_erase(sd);
+    if (sd_erase(sd)) {
+        return sd_r1b;
+    }
     /* Bzzzzzzztt .... Operation complete.  */
     sd->state = sd_transfer_state;
     return sd_r1b;
@@ -2363,6 +3296,7 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
      * if not, its effects are cancelled */
     if (sd->multi_blk_cnt != 0 && !(req.cmd == 18 || req.cmd == 25)) {
         sd->multi_blk_cnt = 0;
+        sd->reliable_write = false;
     }
 
     if (sd->proto->cmd[req.cmd].class == 6 && FIELD_EX32(sd->ocr, OCR,
@@ -2700,7 +3634,9 @@ static size_t sd_write_data(SDState *sd, const void *buf, size_t length)
             sd->blk_written ++;
             sd->csd[14] |= 0x40;
             /* Bzzzzzzztt .... Operation complete.  */
-            sd->state = sd_transfer_state;
+            if (!sd->program_count) {
+                sd->state = sd_transfer_state;
+            }
         }
         break;
 
@@ -2744,7 +3680,10 @@ static size_t sd_write_data(SDState *sd, const void *buf, size_t length)
             if (sd->multi_blk_cnt != 0) {
                 if (--sd->multi_blk_cnt == 0) {
                     /* Stop! */
-                    sd->state = sd_transfer_state;
+                    sd->reliable_write = false;
+                    if (!sd->program_count) {
+                        sd->state = sd_transfer_state;
+                    }
                     break;
                 }
             }
@@ -2890,6 +3829,7 @@ static size_t sd_read_data(SDState *sd, void *buf, size_t length)
             if (sd->multi_blk_cnt != 0) {
                 if (--sd->multi_blk_cnt == 0) {
                     /* Stop! */
+                    sd->reliable_write = false;
                     sd->state = sd_transfer_state;
                     break;
                 }
@@ -3076,6 +4016,12 @@ static void sd_instance_init(Object *obj)
     sd->proto = sc->proto;
     sd->last_cmd_name = "UNSET";
     sd->ocr_power_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sd_ocr_powerup, sd);
+    sd->cache_flush_timer = timer_new_us(
+        QEMU_CLOCK_VIRTUAL, sd_emmc_cache_flush_timer, sd);
+    sd->program_timer = timer_new_us(
+        QEMU_CLOCK_VIRTUAL, sd_emmc_program_timer, sd);
+    sd->erase_timer = timer_new_us(
+        QEMU_CLOCK_VIRTUAL, sd_emmc_erase_timer, sd);
 }
 
 static void sd_instance_finalize(Object *obj)
@@ -3083,6 +4029,13 @@ static void sd_instance_finalize(Object *obj)
     SDState *sd = SDMMC_COMMON(obj);
 
     timer_free(sd->ocr_power_timer);
+    timer_free(sd->cache_flush_timer);
+    timer_free(sd->program_timer);
+    timer_free(sd->erase_timer);
+    g_clear_pointer(&sd->cache_index, g_hash_table_destroy);
+    g_free(sd->cache_entries);
+    g_free(sd->program_entries);
+    g_free(sd->cyw_ram);
 }
 
 static void sd_blk_size_error(SDState *sd, int64_t blk_size,
@@ -3131,7 +4084,9 @@ static void sd_realize(DeviceState *dev, Error **errp)
         blk_size = blk_getlength(sd->blk);
     }
     if (blk_size >= 0) {
-        blk_size -= sd->boot_part_size * 2 + sd->rpmb_part_size;
+        if (sd_is_emmc(sd) && !sd_has_separate_partitions(sd)) {
+            blk_size -= sd->boot_part_size * 2 + sd->rpmb_part_size;
+        }
         if (blk_size > SDSC_MAX_CAPACITY) {
             if (sd_is_emmc(sd) &&
                 !QEMU_IS_ALIGNED(blk_size, 1 << HWBLOCK_SHIFT)) {
@@ -3155,13 +4110,17 @@ static void sd_realize(DeviceState *dev, Error **errp)
             error_setg(errp, "eMMC image smaller than boot partitions");
             return;
         }
-
-        ret = blk_set_perm(sd->blk, BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+    }
+    if (sd->blk) {
+        ret = blk_set_perm(sd->blk,
+                           BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
                            BLK_PERM_ALL, errp);
         if (ret < 0) {
             return;
         }
-        blk_set_dev_ops(sd->blk, &sd_block_ops, sd);
+        blk_set_dev_ops(sd->blk, sd_is_emmc(sd) ? &emmc_block_ops :
+                                                   &sd_block_ops,
+                        sd);
     }
     if (!QEMU_IS_ALIGNED(sd->boot_part_size, 128 * KiB) ||
         sd->boot_part_size > 255 * 128 * KiB) {
@@ -3208,10 +4167,150 @@ static void sd_realize(DeviceState *dev, Error **errp)
 static void emmc_realize(DeviceState *dev, Error **errp)
 {
     SDState *sd = SDMMC_COMMON(dev);
+    Error *local_err = NULL;
+    int64_t length;
+
+    if (sd->cache_size &&
+        (!QEMU_IS_ALIGNED(sd->cache_size, 512) ||
+         sd->cache_size > 16 * MiB)) {
+        error_setg(errp, "eMMC cache size must be a multiple of 512 bytes "
+                   "and no larger than 16 MiB");
+        return;
+    }
+    if (sd->cache_flush_sector_delay_us && !sd->cache_size) {
+        error_setg(errp, "eMMC cache flush delay requires a nonzero "
+                   "cache size");
+        return;
+    }
+    if (sd->cache_flush_sector_delay_us > INT64_MAX / 2) {
+        error_setg(errp, "eMMC cache flush sector delay is too large");
+        return;
+    }
+    if (sd->program_sector_delay_us > INT64_MAX / 2) {
+        error_setg(errp, "eMMC program sector delay is too large");
+        return;
+    }
+    if (sd->erase_group_delay_us > INT64_MAX / 2) {
+        error_setg(errp, "eMMC erase group delay is too large");
+        return;
+    }
+    sd->cache_capacity = sd->cache_size / 512;
+    if (sd->cache_capacity) {
+        sd->cache_entries = g_new0(EMMCCacheEntry, sd->cache_capacity);
+        sd->cache_index = g_hash_table_new(g_int64_hash, g_int64_equal);
+    }
+
+    if (sd->preset_cid) {
+        const char *pos = sd->preset_cid;
+        size_t cid_length = strlen(sd->preset_cid);
+        uint8_t expected_crc;
+
+        if (cid_length != 30 && cid_length != 32) {
+            error_setg(errp, "eMMC CID must contain 15 or 16 bytes "
+                       "encoded hexadecimally");
+            return;
+        }
+        memset(sd->configured_cid, 0, sizeof(sd->configured_cid));
+        for (unsigned int n = 0; n < cid_length / 2;
+             n++, pos += 2) {
+            int chrs;
+
+            if (sscanf(pos, "%02hhx%n", &sd->configured_cid[n], &chrs) != 1
+                || chrs != 2) {
+                error_setg(errp, "eMMC CID contains invalid characters");
+                return;
+            }
+        }
+        expected_crc = (sd_crc7(sd->configured_cid, 15) << 1) | 1;
+        if (cid_length == 30 || sd->configured_cid[15] == 0) {
+            /* Linux sysfs normalizes the CRC/end byte to zero. */
+            sd->configured_cid[15] = expected_crc;
+        } else if (sd->configured_cid[15] != expected_crc) {
+            error_setg(errp, "eMMC CID has an invalid CRC7 or end bit");
+            return;
+        }
+    }
+
+    if (sd_has_separate_partitions(sd)) {
+        if (sd->boot_blk) {
+            length = blk_getlength(sd->boot_blk);
+            if (length <= 0 || !QEMU_IS_ALIGNED(length, 256 * KiB) ||
+                length / 2 > 255 * 128 * KiB) {
+                error_setg(errp, "eMMC boot partition backend size must be "
+                           "twice a nonzero 128 KiB unit, with each "
+                           "partition no larger than 32,640 KiB");
+                return;
+            }
+            if (sd->boot_part_size &&
+                length != 2 * sd->boot_part_size) {
+                error_setg(errp, "eMMC boot partition backend size does not "
+                           "match boot-partition-size");
+                return;
+            }
+            sd->boot_part_size = length / 2;
+        } else if (sd->boot_part_size) {
+            error_setg(errp, "separate eMMC layout requires a boot partition "
+                       "backend when boot-partition-size is nonzero");
+            return;
+        }
+
+        if (sd->rpmb_blk) {
+            length = blk_getlength(sd->rpmb_blk);
+            if (length <= 0 || !QEMU_IS_ALIGNED(length, 128 * KiB) ||
+                length > 128 * 128 * KiB) {
+                error_setg(errp, "eMMC RPMB backend size must be a nonzero "
+                           "128 KiB unit no larger than 16,384 KiB");
+                return;
+            }
+            if (sd->rpmb_part_size && length != sd->rpmb_part_size) {
+                error_setg(errp, "eMMC RPMB backend size does not match "
+                           "rpmb-partition-size");
+                return;
+            }
+            sd->rpmb_part_size = length;
+        } else if (sd->rpmb_part_size) {
+            error_setg(errp, "separate eMMC layout requires an RPMB backend "
+                       "when rpmb-partition-size is nonzero");
+            return;
+        }
+    }
 
     sd->spec_version = SD_PHY_SPECv3_01_VERS; /* Actually v4.5 */
 
-    sd_realize(dev, errp);
+    sd_realize(dev, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
+
+    if (sd->boot_blk) {
+        if (!blk_supports_write_perm(sd->boot_blk)) {
+            error_setg(errp, "cannot use read-only drive as eMMC boot "
+                       "partition backend");
+            return;
+        }
+        if (blk_set_perm(sd->boot_blk,
+                         BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                         BLK_PERM_ALL, errp) < 0) {
+            error_prepend(errp, "cannot use eMMC boot partition backend: ");
+            return;
+        }
+        blk_set_dev_ops(sd->boot_blk, &emmc_block_ops, sd);
+    }
+    if (sd->rpmb_blk) {
+        if (!blk_supports_write_perm(sd->rpmb_blk)) {
+            error_setg(errp, "cannot use read-only drive as eMMC RPMB "
+                       "backend");
+            return;
+        }
+        if (blk_set_perm(sd->rpmb_blk,
+                         BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                         BLK_PERM_ALL, errp) < 0) {
+            error_prepend(errp, "cannot use eMMC RPMB backend: ");
+            return;
+        }
+        blk_set_dev_ops(sd->rpmb_blk, &emmc_block_ops, sd);
+    }
 }
 
 static const Property sdmmc_common_properties[] = {
@@ -3227,8 +4326,1584 @@ static const Property emmc_properties[] = {
     DEFINE_PROP_UINT64("boot-partition-size", SDState, boot_part_size, 0),
     DEFINE_PROP_UINT8("boot-config", SDState, boot_config, 0x0),
     DEFINE_PROP_UINT64("rpmb-partition-size", SDState, rpmb_part_size, 0),
+    DEFINE_PROP_DRIVE("boot-partition-drive", SDState, boot_blk),
+    DEFINE_PROP_DRIVE("rpmb-partition-drive", SDState, rpmb_blk),
+    DEFINE_PROP_STRING("cid", SDState, preset_cid),
     DEFINE_PROP_STRING("auth-key", SDState, preset_auth_key),
+    DEFINE_PROP_SIZE("cache-size", SDState, cache_size, 0),
+    DEFINE_PROP_BOOL("cache-power-loss-on-reset", SDState,
+                     cache_power_loss_on_reset, false),
+    DEFINE_PROP_UINT64("cache-flush-sector-delay-us", SDState,
+                       cache_flush_sector_delay_us, 0),
+    DEFINE_PROP_UINT64("program-sector-delay-us", SDState,
+                       program_sector_delay_us, 0),
+    DEFINE_PROP_UINT64("erase-group-delay-us", SDState,
+                       erase_group_delay_us, 0),
 };
+
+static void emmc_get_cache_dirty_sectors(Object *obj, Visitor *v,
+                                         const char *name, void *opaque,
+                                         Error **errp)
+{
+    uint32_t value = SDMMC_COMMON(obj)->cache_count;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static bool emmc_get_cache_flush_active(Object *obj, Error **errp)
+{
+    return SDMMC_COMMON(obj)->cache_flush_active;
+}
+
+static void emmc_get_cache_flush_completed(Object *obj, Visitor *v,
+                                           const char *name, void *opaque,
+                                           Error **errp)
+{
+    uint64_t value = SDMMC_COMMON(obj)->cache_flush_completed_sectors;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void emmc_get_program_pending(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp)
+{
+    uint32_t value = SDMMC_COMMON(obj)->program_count;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static bool emmc_get_program_active(Object *obj, Error **errp)
+{
+    return SDMMC_COMMON(obj)->program_active;
+}
+
+static void emmc_get_program_completed(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    uint64_t value = SDMMC_COMMON(obj)->program_completed_sectors;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static bool emmc_get_erase_active(Object *obj, Error **errp)
+{
+    return SDMMC_COMMON(obj)->erase_active;
+}
+
+static void emmc_get_erase_pending(Object *obj, Visitor *v,
+                                   const char *name, void *opaque,
+                                   Error **errp)
+{
+    SDState *sd = SDMMC_COMMON(obj);
+    uint64_t value = 0;
+
+    if (sd->erase_next != UINT64_MAX && sd->erase_next < sd->erase_last) {
+        value = DIV_ROUND_UP(sd->erase_last - sd->erase_next,
+                             EMMC_HC_ERASE_GROUP_BYTES);
+    }
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void emmc_get_erase_completed(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp)
+{
+    uint64_t value = SDMMC_COMMON(obj)->erase_completed_groups;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+#define CYW_SDIO_OCR                 0x00ff8000
+#define CYW_SDIO_FUNCTIONS           2
+#define CYW_SDIO_CCCR_IO_ENABLE      0x02
+#define CYW_SDIO_CCCR_IO_READY       0x03
+#define CYW_SDIO_CCCR_INT_ENABLE     0x04
+#define CYW_SDIO_CCCR_INT_PENDING    0x05
+#define CYW_SDIO_CCCR_IO_ABORT       0x06
+#define CYW_SDIO_CCCR_BUS_IF         0x07
+#define CYW_SDIO_CCCR_CAPS           0x08
+#define CYW_SDIO_CCCR_SPEED          0x13
+#define CYW_SDIO_CCCR_BRCM_CARDCAP   0xf0
+#define CYW_SDIO_CCCR_BRCM_CARDCTRL  0xf1
+#define CYW_SDIO_FUNC1_MISC_BASE     0x10000
+#define CYW_SDIO_FUNC1_SBADDRLOW     0x0a
+#define CYW_SDIO_FUNC1_SBADDRMID     0x0b
+#define CYW_SDIO_FUNC1_SBADDRHIGH    0x0c
+#define CYW_SDIO_FUNC1_CHIPCLKCSR    0x0e
+#define CYW_SDIO_FUNC1_SLEEPCSR      0x1f
+#define CYW_SDIO_SB_OFT_MASK         0x7fff
+#define CYW_SDPCM_SHARED_SIZE        64
+#define CYW_SDPCM_SHARED_VERSION     3
+#define CYW_SDIO_CHIPCOMMON_BASE     0x18000000
+#define CYW_SDIO_CHIP_ID             0x15294345
+#define CYW_SDIO_EROM_BASE           0x18110000
+#define CYW_SDIO_RAM_BASE            0x00198000
+#define CYW_SDIO_DEFAULT_RAM_SIZE    0x000c8000
+#define CYW_SDIO_CORE_CHIPCOMMON     0x800
+#define CYW_SDIO_CORE_80211          0x812
+#define CYW_SDIO_CORE_SDIO_DEV       0x829
+#define CYW_SDIO_CORE_ARM_CR4        0x83e
+
+#define CYW_DMP_COMPONENT(id)         (((id) << 8) | 0x1)
+#define CYW_DMP_COMPONENT_INFO(rev)   (((rev) << 24) | BIT(19) | 0x1)
+#define CYW_DMP_SLAVE_ADDRESS(base)   ((base) | 0x5)
+#define CYW_DMP_SWRAP_ADDRESS(base)   ((base) | 0x85)
+
+/*
+ * The enumeration ROM is consumed by brcmf_chip_dmp_erom_scan().  Keep
+ * ChipCommon first and describe one regular 4 KiB slave plus one 4 KiB
+ * slave-wrapper region per core.
+ */
+static const uint32_t cyw_sdio_erom[] = {
+    CYW_DMP_COMPONENT(CYW_SDIO_CORE_CHIPCOMMON),
+    CYW_DMP_COMPONENT_INFO(54),
+    CYW_DMP_SLAVE_ADDRESS(0x18000000),
+    CYW_DMP_SWRAP_ADDRESS(0x18100000),
+
+    CYW_DMP_COMPONENT(CYW_SDIO_CORE_SDIO_DEV),
+    CYW_DMP_COMPONENT_INFO(12),
+    CYW_DMP_SLAVE_ADDRESS(0x18002000),
+    CYW_DMP_SWRAP_ADDRESS(0x18102000),
+
+    CYW_DMP_COMPONENT(CYW_SDIO_CORE_80211),
+    CYW_DMP_COMPONENT_INFO(65),
+    CYW_DMP_SLAVE_ADDRESS(0x18001000),
+    CYW_DMP_SWRAP_ADDRESS(0x18101000),
+
+    CYW_DMP_COMPONENT(CYW_SDIO_CORE_ARM_CR4),
+    CYW_DMP_COMPONENT_INFO(1),
+    CYW_DMP_SLAVE_ADDRESS(0x18003000),
+    CYW_DMP_SWRAP_ADDRESS(0x18103000),
+
+    0xf,
+};
+
+static const uint32_t cyw_sdio_core_base[] = {
+    0x18000000, 0x18002000, 0x18001000, 0x18003000,
+};
+
+static const uint32_t cyw_sdio_core_wrap[] = {
+    0x18100000, 0x18102000, 0x18101000, 0x18103000,
+};
+
+#define CYW_BCMA_IOCTL                 0x408
+#define CYW_BCMA_IOCTL_CLK             BIT(0)
+#define CYW_BCMA_RESET_CTL             0x800
+#define CYW_BCMA_RESET_ST              0x804
+#define CYW_ARMCR4_CAP                 0x04
+#define CYW_ARMCR4_BANKIDX             0x40
+#define CYW_ARMCR4_BANKINFO            0x44
+#define CYW_ARMCR4_BANK_COUNT          1
+#define CYW_ARMCR4_BANKINFO_800K       0x63
+#define CYW_ARMCR4_CORE_INDEX          3
+#define CYW_SDIO_CORE_BASE             0x18002000
+#define CYW_SDIO_INTSTATUS             0x20
+#define CYW_SDIO_HOSTINTMASK           0x24
+#define CYW_SDIO_TOSBMAILBOX           0x40
+#define CYW_SDIO_TOHOSTMAILBOX         0x44
+#define CYW_SDIO_TOSBMAILBOXDATA       0x48
+#define CYW_SDIO_TOHOSTMAILBOXDATA     0x4c
+#define CYW_SDIO_I_HMB_HOST_INT        BIT(7)
+#define CYW_SDIO_I_HMB_FRAME_IND       BIT(6)
+#define CYW_SDIO_HMB_DATA_FWREADY      BIT(3)
+#define CYW_SDIO_HMB_DATA_VERSION_SHIFT 16
+#define CYW_SDIO_PROTOCOL_VERSION      4
+#define CYW_SDIO_SMB_INT_ACK           BIT(1)
+#define CYW_SDPCM_HEADER_SIZE           12
+#define CYW_SDPCM_HWEXT_SIZE             8
+#define CYW_SDPCM_CONTROL_CHANNEL       0
+#define CYW_SDPCM_EVENT_CHANNEL         1
+#define CYW_SDPCM_DATA_CHANNEL          2
+#define CYW_BCDC_DCMD_SIZE              16
+#define CYW_BCDC_HEADER_SIZE            4
+#define CYW_BCDC_PROTOCOL_VERSION       2
+#define CYW_BCDC_WLC_GET_VERSION        1
+#define CYW_BCDC_WLC_GET_BANDLIST       140
+#define CYW_BCDC_WLC_GET_VAR            262
+#define CYW_BCDC_WLC_SET_VAR            263
+#define CYW_BCDC_IOCTL_VERSION           2
+
+static const uint8_t cyw_sdio_cis_common[] = {
+    0x20, 0x04, 0xd0, 0x02, 0xbf, 0xa9, /* Broadcom CYW43455 */
+    0x21, 0x02, 0x0c, 0x00,             /* SDIO function */
+    0x22, 0x04, 0x00, 0x00, 0x02, 0x32, /* 512-byte, 25 MHz */
+    0xff,
+};
+
+static const uint8_t cyw_sdio_cis_func1[49] = {
+    [0] = 0x21, [1] = 0x02, [2] = 0x0c,
+    [4] = 0x22, [5] = 42, [6] = 0x01,
+    [18] = 0x40, [19] = 0x00, /* 64-byte maximum block */
+    [34] = 10,                /* 100 ms enable timeout */
+    [48] = 0xff,
+};
+
+static const uint8_t cyw_sdio_cis_func2[49] = {
+    [0] = 0x21, [1] = 0x02, [2] = 0x0c,
+    [4] = 0x22, [5] = 42, [6] = 0x01,
+    [18] = 0x00, [19] = 0x02, /* 512-byte maximum block */
+    [34] = 10,                /* 100 ms enable timeout */
+    [48] = 0xff,
+};
+
+static uint8_t cyw_sdio_cis_read(uint32_t address)
+{
+    if (address >= 0x1000 &&
+        address < 0x1000 + sizeof(cyw_sdio_cis_common)) {
+        return cyw_sdio_cis_common[address - 0x1000];
+    }
+    if (address >= 0x1100 &&
+        address < 0x1100 + sizeof(cyw_sdio_cis_func1)) {
+        return cyw_sdio_cis_func1[address - 0x1100];
+    }
+    if (address >= 0x1200 &&
+        address < 0x1200 + sizeof(cyw_sdio_cis_func2)) {
+        return cyw_sdio_cis_func2[address - 0x1200];
+    }
+    return 0xff;
+}
+
+static uint32_t cyw_sdio_backplane_address(SDState *sd, uint32_t address)
+{
+    uint32_t window = (uint32_t)sd->cyw_func1_regs[
+        CYW_SDIO_FUNC1_SBADDRLOW] << 8;
+
+    window |= (uint32_t)sd->cyw_func1_regs[
+        CYW_SDIO_FUNC1_SBADDRMID] << 16;
+    window |= (uint32_t)sd->cyw_func1_regs[
+        CYW_SDIO_FUNC1_SBADDRHIGH] << 24;
+    return window | (address & CYW_SDIO_SB_OFT_MASK);
+}
+
+static int cyw_sdio_wrapper_index(uint32_t address, uint32_t *offset)
+{
+    for (unsigned int i = 0; i < ARRAY_SIZE(cyw_sdio_core_wrap); i++) {
+        if (address >= cyw_sdio_core_wrap[i] &&
+            address < cyw_sdio_core_wrap[i] + 0x1000) {
+            *offset = address - cyw_sdio_core_wrap[i];
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void cyw_sdio_update_irq(SDState *sd)
+{
+    bool enabled = (sd->cyw_cccr[CYW_SDIO_CCCR_INT_ENABLE] &
+                    (BIT(0) | BIT(1))) == (BIT(0) | BIT(1));
+    bool level = enabled && (sd->cyw_intstatus & sd->cyw_hostintmask);
+
+    sd->cyw_cccr[CYW_SDIO_CCCR_INT_PENDING] = level ? BIT(1) : 0;
+    if (sd->cyw_sdio_irq != level) {
+        trace_cyw_sdio_irq(level, sd->cyw_intstatus,
+                           sd->cyw_hostintmask,
+                           sd->cyw_cccr[CYW_SDIO_CCCR_INT_ENABLE]);
+        sd->cyw_sdio_irq = level;
+        sdbus_set_sdio_irq(
+            SD_BUS(qdev_get_parent_bus(DEVICE(sd))), level);
+    }
+}
+
+static bool cyw_sdio_register_read(SDState *sd, uint32_t address,
+                                   uint32_t *value)
+{
+    uint32_t offset;
+    int index = cyw_sdio_wrapper_index(address, &offset);
+
+    if (address == CYW_SDIO_CHIPCOMMON_BASE) {
+        *value = CYW_SDIO_CHIP_ID;
+        return true;
+    }
+    if (address == CYW_SDIO_CHIPCOMMON_BASE + 0xfc) {
+        *value = CYW_SDIO_EROM_BASE;
+        return true;
+    }
+    if (address >= CYW_SDIO_EROM_BASE &&
+        address < CYW_SDIO_EROM_BASE + sizeof(cyw_sdio_erom)) {
+        *value = cyw_sdio_erom[
+            (address - CYW_SDIO_EROM_BASE) / sizeof(uint32_t)];
+        return true;
+    }
+    if (index >= 0) {
+        if (offset == CYW_BCMA_IOCTL) {
+            *value = sd->cyw_core_ioctl[index];
+            return true;
+        }
+        if (offset == CYW_BCMA_RESET_CTL) {
+            *value = sd->cyw_core_reset[index];
+            return true;
+        }
+        if (offset == CYW_BCMA_RESET_ST) {
+            *value = 0;
+            return true;
+        }
+    }
+    if (address == cyw_sdio_core_base[3] + CYW_ARMCR4_CAP) {
+        *value = CYW_ARMCR4_BANK_COUNT;
+        return true;
+    }
+    if (address == cyw_sdio_core_base[3] + CYW_ARMCR4_BANKIDX) {
+        *value = sd->cyw_armcr4_bankidx;
+        return true;
+    }
+    if (address == cyw_sdio_core_base[3] + CYW_ARMCR4_BANKINFO) {
+        *value = sd->cyw_armcr4_bankidx == 0 ?
+                 CYW_ARMCR4_BANKINFO_800K : 0;
+        return true;
+    }
+    if (address >= CYW_SDIO_CORE_BASE &&
+        address < CYW_SDIO_CORE_BASE + 0x1000) {
+        switch (address - CYW_SDIO_CORE_BASE) {
+        case CYW_SDIO_INTSTATUS:
+            *value = sd->cyw_intstatus;
+            return true;
+        case CYW_SDIO_HOSTINTMASK:
+            *value = sd->cyw_hostintmask;
+            return true;
+        case CYW_SDIO_TOSBMAILBOX:
+            *value = sd->cyw_tosbmailbox;
+            return true;
+        case CYW_SDIO_TOHOSTMAILBOX:
+            *value = sd->cyw_tohostmailbox;
+            return true;
+        case CYW_SDIO_TOSBMAILBOXDATA:
+            *value = sd->cyw_tosbmailboxdata;
+            return true;
+        case CYW_SDIO_TOHOSTMAILBOXDATA:
+            *value = sd->cyw_tohostmailboxdata;
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint8_t cyw_sdio_backplane_read(SDState *sd, uint32_t address)
+{
+    uint32_t value;
+    uint32_t aligned = address & ~3;
+
+    if (cyw_sdio_register_read(sd, aligned, &value)) {
+        return (value >> ((address & 3) * 8)) & 0xff;
+    }
+    if (address < sizeof(sd->cyw_reset_vector)) {
+        return (sd->cyw_reset_vector >> (address * 8)) & 0xff;
+    }
+    if (address >= CYW_SDIO_RAM_BASE &&
+        address < CYW_SDIO_RAM_BASE + sd->cyw_ram_size) {
+        return sd->cyw_ram[address - CYW_SDIO_RAM_BASE];
+    }
+    return 0;
+}
+
+static bool cyw_sdio_nvram_valid(SDState *sd, uint32_t *size)
+{
+    uint32_t token = ldl_le_p(sd->cyw_ram + sd->cyw_ram_size -
+                             sizeof(token));
+    uint16_t words = token;
+
+    if (!words || (uint16_t)(token >> 16) != (uint16_t)~words ||
+        (uint32_t)words * sizeof(uint32_t) > sd->cyw_ram_size) {
+        return false;
+    }
+    *size = (uint32_t)words * sizeof(uint32_t);
+    return true;
+}
+
+static void cyw_sdio_armcr4_release(SDState *sd)
+{
+    uint32_t nvram_size;
+    uint32_t shared_offset;
+
+    sd->cyw_firmware_started = false;
+    sd->cyw_nvram_size = 0;
+    sd->cyw_shared_address = 0;
+    if (!sd->cyw_reset_vector_valid || !sd->cyw_firmware_bytes ||
+        !cyw_sdio_nvram_valid(sd, &nvram_size)) {
+        sd->cyw_start_failures++;
+        return;
+    }
+    sd->cyw_nvram_size = nvram_size;
+    shared_offset = ROUND_DOWN(sd->cyw_ram_size - sizeof(uint32_t) -
+                               nvram_size - CYW_SDPCM_SHARED_SIZE,
+                               sizeof(uint32_t));
+    memset(sd->cyw_ram + shared_offset, 0, CYW_SDPCM_SHARED_SIZE);
+    stl_le_p(sd->cyw_ram + shared_offset, CYW_SDPCM_SHARED_VERSION);
+    sd->cyw_shared_address = CYW_SDIO_RAM_BASE + shared_offset;
+    stl_le_p(sd->cyw_ram + sd->cyw_ram_size - sizeof(uint32_t),
+             sd->cyw_shared_address);
+    sd->cyw_firmware_started = true;
+    qemu_flush_queued_packets(qemu_get_queue(sd->cyw_nic));
+}
+
+static void cyw_sdio_firmware_ready(SDState *sd)
+{
+    if (!sd->cyw_firmware_started) {
+        return;
+    }
+    sd->cyw_tohostmailboxdata =
+        (CYW_SDIO_PROTOCOL_VERSION << CYW_SDIO_HMB_DATA_VERSION_SHIFT) |
+        CYW_SDIO_HMB_DATA_FWREADY;
+    sd->cyw_intstatus |= CYW_SDIO_I_HMB_HOST_INT;
+    cyw_sdio_update_irq(sd);
+}
+
+static void cyw_sdio_bcdc_response(SDState *sd, uint8_t *dcmd,
+                                    size_t available)
+{
+    static const char firmware_version[] =
+        "QEMU Raspberry Pi CYW43455 7.45.241";
+    static const char capabilities[] = "sta";
+    uint8_t *payload = dcmd + CYW_BCDC_DCMD_SIZE;
+    size_t payload_size = available - CYW_BCDC_DCMD_SIZE;
+    uint32_t command = ldl_le_p(dcmd);
+    uint32_t flags = ldl_le_p(dcmd + 8);
+    const char *iovar = (const char *)payload;
+    size_t iovar_size = strnlen(iovar, payload_size);
+    const void *response = NULL;
+    size_t response_size = 0;
+
+    stl_le_p(dcmd + 12, 0);
+    if ((command == CYW_BCDC_WLC_GET_VAR ||
+         command == CYW_BCDC_WLC_SET_VAR) &&
+        iovar_size < payload_size) {
+        trace_cyw_sdio_iovar(iovar, command == CYW_BCDC_WLC_SET_VAR);
+        if (command == CYW_BCDC_WLC_SET_VAR &&
+            !strcmp(iovar, "allmulti") &&
+            sd->cyw_nic_conf.peers.ncs[0] &&
+            !sd->cyw_link_event_sent) {
+            sd->cyw_link_event_pending = true;
+            sd->cyw_link_event_sent = true;
+        }
+    }
+    if (flags & BIT(1) || command == CYW_BCDC_WLC_SET_VAR) {
+        return;
+    }
+    if (command == CYW_BCDC_WLC_GET_VERSION) {
+        memset(payload, 0, payload_size);
+        if (payload_size >= sizeof(uint32_t)) {
+            stl_le_p(payload, CYW_BCDC_IOCTL_VERSION);
+        }
+        return;
+    } else if (command == CYW_BCDC_WLC_GET_BANDLIST) {
+        memset(payload, 0, payload_size);
+        if (payload_size >= 2 * sizeof(uint32_t)) {
+            stl_le_p(payload, 1);     /* one supported band */
+            stl_le_p(payload + 4, 2); /* WLC_BAND_2G */
+        }
+        return;
+    } else if (command == CYW_BCDC_WLC_GET_VAR &&
+               iovar_size < payload_size) {
+        if (!strcmp(iovar, "ver")) {
+            response = firmware_version;
+            response_size = sizeof(firmware_version);
+        } else if (!strcmp(iovar, "cur_etheraddr")) {
+            response = sd->cyw_nic_conf.macaddr.a;
+            response_size = sizeof(sd->cyw_nic_conf.macaddr.a);
+        } else if (!strcmp(iovar, "cap")) {
+            response = capabilities;
+            response_size = sizeof(capabilities);
+        } else if (!strcmp(iovar, "chanspec")) {
+            memset(payload, 0, payload_size);
+            if (payload_size >= sizeof(uint32_t)) {
+                stl_le_p(payload, 0x2b01); /* channel 1, 20 MHz, 2.4 GHz */
+            }
+            return;
+        }
+    }
+    memset(payload, 0, payload_size);
+    if (response) {
+        memcpy(payload, response, MIN(payload_size, response_size));
+    }
+}
+
+static void cyw_sdio_queue_control_response(SDState *sd)
+{
+    uint16_t frame_size = lduw_le_p(sd->cyw_transfer);
+    uint16_t checksum = lduw_le_p(sd->cyw_transfer + 2);
+    uint32_t sw_header;
+    uint16_t response_size;
+    uint8_t data_offset;
+
+    trace_cyw_sdio_control_header(
+        ldl_le_p(sd->cyw_transfer), ldl_le_p(sd->cyw_transfer + 4),
+        ldl_le_p(sd->cyw_transfer + 8), ldl_le_p(sd->cyw_transfer + 12));
+    if (frame_size < CYW_SDPCM_HEADER_SIZE + CYW_BCDC_DCMD_SIZE ||
+        frame_size > sd->cyw_transfer_size ||
+        checksum != (uint16_t)~frame_size ||
+        sd->cyw_rx_queue_size != sd->cyw_rx_queue_offset) {
+        trace_cyw_sdio_control_reject(
+            1, frame_size, sd->cyw_transfer_size, 0,
+            sd->cyw_rx_queue_size, sd->cyw_rx_queue_offset);
+        sd->cyw_control_rejections++;
+        return;
+    }
+    sw_header = ldl_le_p(sd->cyw_transfer + 4);
+    data_offset = extract32(sw_header, 24, 8);
+    /*
+     * Once brcmfmac enables txglom, control frames carry an eight-byte
+     * hardware-extension header between the length tag and software header.
+     */
+    if ((data_offset < CYW_SDPCM_HEADER_SIZE ||
+         data_offset + CYW_BCDC_DCMD_SIZE > frame_size) &&
+        frame_size >= CYW_SDPCM_HEADER_SIZE + CYW_SDPCM_HWEXT_SIZE +
+                      CYW_BCDC_DCMD_SIZE) {
+        uint32_t extended_sw_header =
+            ldl_le_p(sd->cyw_transfer + sizeof(uint32_t) +
+                     CYW_SDPCM_HWEXT_SIZE);
+        uint8_t extended_data_offset =
+            extract32(extended_sw_header, 24, 8);
+
+        if (extended_data_offset >=
+                CYW_SDPCM_HEADER_SIZE + CYW_SDPCM_HWEXT_SIZE &&
+            extended_data_offset + CYW_BCDC_DCMD_SIZE <= frame_size) {
+            sw_header = extended_sw_header;
+            data_offset = extended_data_offset;
+        }
+    }
+    if (data_offset < CYW_SDPCM_HEADER_SIZE ||
+        data_offset + CYW_BCDC_DCMD_SIZE > frame_size ||
+        frame_size > sizeof(sd->cyw_rx_queue)) {
+        trace_cyw_sdio_control_reject(
+            2, frame_size, sd->cyw_transfer_size, data_offset,
+            sd->cyw_rx_queue_size, sd->cyw_rx_queue_offset);
+        sd->cyw_control_rejections++;
+        return;
+    }
+    sd->cyw_tx_sequence_max = extract32(sw_header, 0, 8) + 2;
+    if (extract32(sw_header, 8, 4) == CYW_SDPCM_DATA_CHANNEL) {
+        uint8_t *bcdc = sd->cyw_transfer + data_offset;
+        uint32_t packet_offset = data_offset + CYW_BCDC_HEADER_SIZE +
+                                 ((uint32_t)bcdc[3] << 2);
+
+        if (extract32(bcdc[0], 4, 4) != CYW_BCDC_PROTOCOL_VERSION ||
+            packet_offset > frame_size) {
+            trace_cyw_sdio_control_reject(
+                3, frame_size, sd->cyw_transfer_size, data_offset,
+                sd->cyw_rx_queue_size, sd->cyw_rx_queue_offset);
+            sd->cyw_control_rejections++;
+            return;
+        }
+        if (!cyw_sdio_inject_packet_drop(sd, CYW_PACKET_DROP_TX)) {
+            qemu_send_packet(qemu_get_queue(sd->cyw_nic),
+                             sd->cyw_transfer + packet_offset,
+                             frame_size - packet_offset);
+            sd->cyw_data_tx_packets++;
+        }
+        return;
+    }
+    if (extract32(sw_header, 8, 4) != CYW_SDPCM_CONTROL_CHANNEL) {
+        trace_cyw_sdio_control_reject(
+            4, frame_size, sd->cyw_transfer_size, data_offset,
+            sd->cyw_rx_queue_size, sd->cyw_rx_queue_offset);
+        sd->cyw_control_rejections++;
+        return;
+    }
+    trace_cyw_sdio_control(frame_size, sd->cyw_transfer_size, data_offset,
+                           ldl_le_p(sd->cyw_transfer + data_offset),
+                           ldl_le_p(sd->cyw_transfer + data_offset + 8));
+
+    /*
+     * Firmware replies use the ordinary receive header even when the host
+     * request used the transmit-glom hardware extension.
+     */
+    response_size = CYW_SDPCM_HEADER_SIZE + frame_size - data_offset;
+    memset(sd->cyw_rx_queue, 0, response_size);
+    memcpy(sd->cyw_rx_queue + CYW_SDPCM_HEADER_SIZE,
+           sd->cyw_transfer + data_offset, frame_size - data_offset);
+    stw_le_p(sd->cyw_rx_queue, response_size);
+    stw_le_p(sd->cyw_rx_queue + 2, (uint16_t)~response_size);
+    stl_le_p(sd->cyw_rx_queue + sizeof(uint32_t),
+             sd->cyw_rx_sequence++ |
+             (CYW_SDPCM_CONTROL_CHANNEL << 8) |
+             (CYW_SDPCM_HEADER_SIZE << 24));
+    stl_le_p(sd->cyw_rx_queue + 2 * sizeof(uint32_t),
+             (uint32_t)(extract32(sw_header, 0, 8) + 2) << 8);
+    cyw_sdio_bcdc_response(
+        sd,
+        sd->cyw_rx_queue + CYW_SDPCM_HEADER_SIZE,
+        response_size - CYW_SDPCM_HEADER_SIZE);
+    if (sd->cyw_link_event_pending) {
+        stl_le_p(sd->cyw_rx_queue + 8,
+                 ldl_le_p(sd->cyw_rx_queue + 8) |
+                 (DIV_ROUND_UP(88, 16) << 16));
+    }
+    sd->cyw_rx_queue_size = response_size;
+    sd->cyw_rx_queue_offset = 0;
+    sd->cyw_func1_regs[0x1b] = response_size;
+    sd->cyw_func1_regs[0x1c] = response_size >> 8;
+    sd->cyw_control_requests++;
+    sd->cyw_intstatus |= CYW_SDIO_I_HMB_FRAME_IND;
+    cyw_sdio_update_irq(sd);
+}
+
+static void cyw_sdio_queue_link_event(SDState *sd)
+{
+    static const uint8_t bssid[6] = { 0x02, 0, 0, 0, 0, 1 };
+    const uint32_t bcdc_offset = CYW_SDPCM_HEADER_SIZE;
+    const uint32_t ethernet_offset = bcdc_offset + CYW_BCDC_HEADER_SIZE;
+    const uint32_t vendor_offset = ethernet_offset + 14;
+    const uint32_t message_offset = vendor_offset + 10;
+    const uint32_t frame_size = message_offset + 48;
+
+    memset(sd->cyw_rx_queue, 0, frame_size);
+    stw_le_p(sd->cyw_rx_queue, frame_size);
+    stw_le_p(sd->cyw_rx_queue + 2, (uint16_t)~frame_size);
+    stl_le_p(sd->cyw_rx_queue + 4,
+             sd->cyw_rx_sequence++ |
+             (CYW_SDPCM_EVENT_CHANNEL << 8) |
+             (CYW_SDPCM_HEADER_SIZE << 24));
+    stl_le_p(sd->cyw_rx_queue + 8, sd->cyw_tx_sequence_max << 8);
+    sd->cyw_rx_queue[bcdc_offset] = CYW_BCDC_PROTOCOL_VERSION << 4;
+    memcpy(sd->cyw_rx_queue + ethernet_offset,
+           sd->cyw_nic_conf.macaddr.a, 6);
+    memcpy(sd->cyw_rx_queue + ethernet_offset + 6, bssid, sizeof(bssid));
+    stw_be_p(sd->cyw_rx_queue + ethernet_offset + 12, 0x886c);
+    stw_be_p(sd->cyw_rx_queue + vendor_offset, 0x8001);
+    stw_be_p(sd->cyw_rx_queue + vendor_offset + 2, 48);
+    sd->cyw_rx_queue[vendor_offset + 5] = 0x00;
+    sd->cyw_rx_queue[vendor_offset + 6] = 0x10;
+    sd->cyw_rx_queue[vendor_offset + 7] = 0x18;
+    stw_be_p(sd->cyw_rx_queue + vendor_offset + 8, 1);
+    stw_be_p(sd->cyw_rx_queue + message_offset, 2);
+    stw_be_p(sd->cyw_rx_queue + message_offset + 2, 1);
+    stl_be_p(sd->cyw_rx_queue + message_offset + 4, 0); /* SET_SSID */
+    memcpy(sd->cyw_rx_queue + message_offset + 24, bssid, sizeof(bssid));
+    memcpy(sd->cyw_rx_queue + message_offset + 30, "wlan0", 6);
+    sd->cyw_rx_queue_size = frame_size;
+    sd->cyw_rx_queue_offset = 0;
+    sd->cyw_func1_regs[0x1b] = frame_size;
+    sd->cyw_func1_regs[0x1c] = frame_size >> 8;
+    sd->cyw_link_event_pending = false;
+    sd->cyw_intstatus |= CYW_SDIO_I_HMB_FRAME_IND;
+    trace_cyw_sdio_link_event(frame_size);
+    cyw_sdio_update_irq(sd);
+}
+
+static void cyw_sdio_backplane_write(SDState *sd, uint32_t address,
+                                     uint8_t value)
+{
+    uint32_t aligned = address & ~3;
+    uint32_t offset;
+    int index = cyw_sdio_wrapper_index(aligned, &offset);
+
+    if (index >= 0 && offset == CYW_BCMA_IOCTL) {
+        sd->cyw_core_ioctl[index] = deposit32(
+            sd->cyw_core_ioctl[index], (address & 3) * 8, 8, value);
+        return;
+    }
+    if (index >= 0 && offset == CYW_BCMA_RESET_CTL) {
+        uint32_t old = sd->cyw_core_reset[index];
+
+        sd->cyw_core_reset[index] = deposit32(
+            sd->cyw_core_reset[index], (address & 3) * 8, 8, value) & BIT(0);
+        if (index == CYW_ARMCR4_CORE_INDEX && (old & BIT(0)) &&
+            !(sd->cyw_core_reset[index] & BIT(0))) {
+            cyw_sdio_armcr4_release(sd);
+        } else if (index == CYW_ARMCR4_CORE_INDEX &&
+                   sd->cyw_core_reset[index] & BIT(0)) {
+            sd->cyw_firmware_started = false;
+        }
+        return;
+    }
+    if (aligned == cyw_sdio_core_base[3] + CYW_ARMCR4_BANKIDX) {
+        sd->cyw_armcr4_bankidx = deposit32(
+            sd->cyw_armcr4_bankidx, (address & 3) * 8, 8, value);
+        return;
+    }
+    if (aligned >= CYW_SDIO_CORE_BASE &&
+        aligned < CYW_SDIO_CORE_BASE + 0x1000) {
+        uint32_t core_offset = aligned - CYW_SDIO_CORE_BASE;
+
+        switch (core_offset) {
+        case CYW_SDIO_INTSTATUS:
+            sd->cyw_intstatus &= ~((uint32_t)value <<
+                                   ((address & 3) * 8));
+            cyw_sdio_update_irq(sd);
+            return;
+        case CYW_SDIO_HOSTINTMASK:
+            sd->cyw_hostintmask = deposit32(
+                sd->cyw_hostintmask, (address & 3) * 8, 8, value);
+            cyw_sdio_update_irq(sd);
+            return;
+        case CYW_SDIO_TOSBMAILBOX:
+            sd->cyw_tosbmailbox = deposit32(
+                sd->cyw_tosbmailbox, (address & 3) * 8, 8, value);
+            if (sd->cyw_tosbmailbox & CYW_SDIO_SMB_INT_ACK) {
+                sd->cyw_intstatus &= ~CYW_SDIO_I_HMB_HOST_INT;
+                sd->cyw_tosbmailbox &= ~CYW_SDIO_SMB_INT_ACK;
+                cyw_sdio_update_irq(sd);
+            }
+            return;
+        case CYW_SDIO_TOSBMAILBOXDATA:
+            sd->cyw_tosbmailboxdata = deposit32(
+                sd->cyw_tosbmailboxdata, (address & 3) * 8, 8, value);
+            return;
+        }
+    }
+    if (address < sizeof(sd->cyw_reset_vector)) {
+        sd->cyw_reset_vector = deposit32(
+            sd->cyw_reset_vector, address * 8, 8, value);
+        sd->cyw_reset_vector_valid = true;
+        return;
+    }
+    if (address >= CYW_SDIO_RAM_BASE &&
+        address < CYW_SDIO_RAM_BASE + sd->cyw_ram_size) {
+        if (sd->cyw_firmware_started) {
+            trace_cyw_sdio_runtime_ram_write(address);
+        }
+        sd->cyw_ram[address - CYW_SDIO_RAM_BASE] = value;
+        sd->cyw_firmware_bytes++;
+        sd->cyw_firmware_started = false;
+    }
+}
+
+static uint8_t cyw_sdio_read_byte(SDState *sd, uint8_t function,
+                                  uint32_t address)
+{
+    if (function == 0) {
+        if (address >= 0x1000 && address < 0x1300) {
+            return cyw_sdio_cis_read(address);
+        }
+        if (address < sizeof(sd->cyw_cccr)) {
+            return sd->cyw_cccr[address];
+        }
+        if (address < sizeof(sd->cyw_fbr)) {
+            return sd->cyw_fbr[address];
+        }
+        return 0xff;
+    }
+    if (function == 1) {
+        if (address >= CYW_SDIO_FUNC1_MISC_BASE &&
+            address < CYW_SDIO_FUNC1_MISC_BASE +
+                      sizeof(sd->cyw_func1_regs)) {
+            return sd->cyw_func1_regs[
+                address - CYW_SDIO_FUNC1_MISC_BASE];
+        }
+        address = cyw_sdio_backplane_address(sd, address);
+        return cyw_sdio_backplane_read(sd, address);
+    }
+    if (function == 2 && sd->cyw_transfer_offset <
+                         sd->cyw_transfer_size) {
+        uint32_t offset = sd->cyw_rx_queue_offset +
+                          sd->cyw_transfer_offset;
+
+        return offset < sd->cyw_rx_queue_size ?
+               sd->cyw_rx_queue[offset] : 0;
+    }
+    return 0xff;
+}
+
+static void cyw_sdio_write_byte(SDState *sd, uint8_t function,
+                                uint32_t address, uint8_t value)
+{
+    if (function == 0) {
+        if (address < sizeof(sd->cyw_cccr)) {
+            sd->cyw_cccr[address] = value;
+            if (address == CYW_SDIO_CCCR_IO_ENABLE) {
+                sd->cyw_cccr[CYW_SDIO_CCCR_IO_READY] =
+                    value & (BIT(1) | BIT(2));
+                if (value & BIT(2)) {
+                    cyw_sdio_firmware_ready(sd);
+                }
+            } else if (address == CYW_SDIO_CCCR_INT_ENABLE) {
+                cyw_sdio_update_irq(sd);
+            } else if (address == CYW_SDIO_CCCR_IO_ABORT &&
+                       value & BIT(3)) {
+                sd->cyw_transfer_size = 0;
+                sd->cyw_transfer_offset = 0;
+            } else if (address == CYW_SDIO_CCCR_BRCM_CARDCTRL &&
+                       value & BIT(1)) {
+                memset(sd->cyw_ram, 0, sd->cyw_ram_size);
+                sd->cyw_reset_vector = 0;
+                sd->cyw_nvram_size = 0;
+                sd->cyw_reset_vector_valid = false;
+                sd->cyw_firmware_started = false;
+                sd->cyw_intstatus = 0;
+                sd->cyw_tohostmailboxdata = 0;
+                cyw_sdio_update_irq(sd);
+            }
+        } else if (address < sizeof(sd->cyw_fbr)) {
+            sd->cyw_fbr[address] = value;
+            if (address == 0x110 || address == 0x111) {
+                sd->cyw_block_size[1] =
+                    lduw_le_p(&sd->cyw_fbr[0x110]);
+            } else if (address == 0x210 || address == 0x211) {
+                sd->cyw_block_size[2] =
+                    lduw_le_p(&sd->cyw_fbr[0x210]);
+            }
+        }
+        return;
+    }
+    if (function == 1) {
+        if (address >= CYW_SDIO_FUNC1_MISC_BASE &&
+            address < CYW_SDIO_FUNC1_MISC_BASE +
+                      sizeof(sd->cyw_func1_regs)) {
+            unsigned int index = address - CYW_SDIO_FUNC1_MISC_BASE;
+
+            sd->cyw_func1_regs[index] = value;
+            if (index == CYW_SDIO_FUNC1_CHIPCLKCSR) {
+                sd->cyw_func1_regs[index] = value | BIT(6) | BIT(7);
+            } else if (index == CYW_SDIO_FUNC1_SLEEPCSR &&
+                       value & BIT(0)) {
+                sd->cyw_func1_regs[index] |= BIT(1);
+            }
+            return;
+        }
+        address = cyw_sdio_backplane_address(sd, address);
+        cyw_sdio_backplane_write(sd, address, value);
+        return;
+    }
+    if (function == 2 && sd->cyw_transfer_offset <
+                         sizeof(sd->cyw_transfer)) {
+        sd->cyw_transfer[sd->cyw_transfer_offset] = value;
+        sd->cyw_tx_bytes++;
+    }
+}
+
+static void cyw_sdio_reset(DeviceState *dev)
+{
+    SDState *sd = CYW43455_SDIO(dev);
+
+    memset(sd->cyw_cccr, 0, sizeof(sd->cyw_cccr));
+    memset(sd->cyw_fbr, 0, sizeof(sd->cyw_fbr));
+    memset(sd->cyw_func1_regs, 0, sizeof(sd->cyw_func1_regs));
+    memset(sd->cyw_transfer, 0, sizeof(sd->cyw_transfer));
+    memset(sd->cyw_rx_queue, 0, sizeof(sd->cyw_rx_queue));
+    if (sd->cyw_ram) {
+        memset(sd->cyw_ram, 0, sd->cyw_ram_size);
+    }
+    sd->cyw_cccr[0x00] = 0x32;
+    sd->cyw_cccr[0x01] = 0x03;
+    sd->cyw_cccr[CYW_SDIO_CCCR_CAPS] = BIT(7) | BIT(1);
+    sd->cyw_cccr[0x09] = 0x00;
+    sd->cyw_cccr[0x0a] = 0x10;
+    sd->cyw_cccr[CYW_SDIO_CCCR_SPEED] = BIT(0);
+    sd->cyw_fbr[0x109] = 0x00;
+    sd->cyw_fbr[0x10a] = 0x11;
+    sd->cyw_fbr[0x209] = 0x00;
+    sd->cyw_fbr[0x20a] = 0x12;
+    sd->cyw_block_size[0] = 64;
+    sd->cyw_block_size[1] = 64;
+    sd->cyw_block_size[2] = 512;
+    sd->cyw_transfer_size = 0;
+    sd->cyw_transfer_offset = 0;
+    sd->cyw_transfer_address = 0;
+    sd->cyw_rca = 0;
+    sd->cyw_function = 0;
+    sd->cyw_selected = false;
+    sd->cyw_transfer_write = false;
+    sd->cyw_transfer_increment = false;
+    sd->cyw_command_count = 0;
+    sd->cyw_command_failures = 0;
+    sd->cyw_firmware_bytes = 0;
+    sd->cyw_tx_bytes = 0;
+    sd->cyw_rx_bytes = 0;
+    for (unsigned int i = 0; i < ARRAY_SIZE(sd->cyw_core_ioctl); i++) {
+        sd->cyw_core_ioctl[i] = CYW_BCMA_IOCTL_CLK;
+        sd->cyw_core_reset[i] = 0;
+    }
+    sd->cyw_armcr4_bankidx = 0;
+    sd->cyw_reset_vector = 0;
+    sd->cyw_nvram_size = 0;
+    sd->cyw_shared_address = 0;
+    sd->cyw_intstatus = 0;
+    sd->cyw_hostintmask = 0;
+    sd->cyw_tosbmailbox = 0;
+    sd->cyw_tohostmailbox = 0;
+    sd->cyw_tosbmailboxdata = 0;
+    sd->cyw_tohostmailboxdata = 0;
+    sd->cyw_rx_queue_size = 0;
+    sd->cyw_rx_queue_offset = 0;
+    sd->cyw_start_failures = 0;
+    sd->cyw_control_requests = 0;
+    sd->cyw_control_rejections = 0;
+    sd->cyw_data_tx_packets = 0;
+    sd->cyw_data_rx_packets = 0;
+    sd->cyw_packet_drop_packets_seen = 0;
+    sd->cyw_packet_drops_injected = 0;
+    sd->cyw_rx_sequence = 0;
+    sd->cyw_tx_sequence_max = 0;
+    sd->cyw_reset_vector_valid = false;
+    sd->cyw_firmware_started = false;
+    sd->cyw_sdio_irq = false;
+    sd->cyw_link_event_pending = false;
+    sd->cyw_link_event_sent = false;
+    sdbus_set_sdio_irq(
+        SD_BUS(qdev_get_parent_bus(DEVICE(sd))), false);
+}
+
+static size_t cyw_sdio_do_command(SDState *sd, SDRequest *req,
+                                  uint8_t *response, size_t respsz)
+{
+    uint32_t value = 0;
+
+    if (req->cmd == sd->cyw_fail_command &&
+        sd->cyw_command_count >= sd->cyw_fail_after) {
+        sd->cyw_command_count++;
+        sd->cyw_command_failures++;
+        return 0;
+    }
+    sd->cyw_command_count++;
+    trace_cyw_sdio_command(req->cmd, req->arg, sd->cyw_command_count);
+    switch (req->cmd) {
+    case 0:
+        cyw_sdio_reset(DEVICE(sd));
+        return 0;
+    case 5:
+        value = BIT(31) | (CYW_SDIO_FUNCTIONS << 28) | CYW_SDIO_OCR;
+        break;
+    case 3:
+        sd->cyw_rca = 1;
+        value = (uint32_t)sd->cyw_rca << 16;
+        break;
+    case 7:
+        sd->cyw_selected = extract32(req->arg, 16, 16) == sd->cyw_rca;
+        value = 0;
+        break;
+    case 52:
+    {
+        bool write = req->arg & BIT(31);
+        bool raw = req->arg & BIT(27);
+        uint8_t function = extract32(req->arg, 28, 3);
+        uint32_t address = extract32(req->arg, 9, 17);
+        uint8_t data = req->arg;
+
+        if (function > CYW_SDIO_FUNCTIONS) {
+            value = BIT(9);
+            break;
+        }
+        if (write) {
+            cyw_sdio_write_byte(sd, function, address, data);
+        }
+        value = write && !raw ? data :
+                cyw_sdio_read_byte(sd, function, address);
+        break;
+    }
+    case 53:
+    {
+        uint32_t count = extract32(req->arg, 0, 9);
+        bool block_mode = req->arg & BIT(27);
+
+        sd->cyw_transfer_write = req->arg & BIT(31);
+        sd->cyw_function = extract32(req->arg, 28, 3);
+        sd->cyw_transfer_increment = req->arg & BIT(26);
+        sd->cyw_transfer_address = extract32(req->arg, 9, 17);
+        if (sd->cyw_function > CYW_SDIO_FUNCTIONS) {
+            sd->cyw_transfer_size = 0;
+            sd->cyw_transfer_offset = 0;
+            value = BIT(9);
+            break;
+        }
+        if (!count) {
+            count = 512;
+        }
+        if (block_mode) {
+            count *= sd->cyw_block_size[sd->cyw_function];
+        }
+        /*
+         * Function 1 is a streaming backplane aperture.  brcmfmac uses the
+         * largest legal multi-block requests while downloading firmware, so
+         * it must not inherit the bounded function-2 packet staging size.
+         */
+        sd->cyw_transfer_size = sd->cyw_function == 2 ?
+            MIN(count, (uint32_t)sizeof(sd->cyw_transfer)) : count;
+        sd->cyw_transfer_offset = 0;
+        value = 0;
+        break;
+    }
+    default:
+        return 0;
+    }
+    if (respsz < sizeof(value)) {
+        return 0;
+    }
+    stl_be_p(response, value);
+    return sizeof(value);
+}
+
+static size_t cyw_sdio_write_data(SDState *sd, const void *buf, size_t len)
+{
+    const uint8_t *bytes = buf;
+    size_t count = MIN(len, sd->cyw_transfer_size -
+                            sd->cyw_transfer_offset);
+
+    for (size_t i = 0; i < count; i++) {
+        uint32_t address = sd->cyw_transfer_address;
+
+        cyw_sdio_write_byte(sd, sd->cyw_function, address, bytes[i]);
+        sd->cyw_transfer_offset++;
+        if (sd->cyw_transfer_increment) {
+            sd->cyw_transfer_address++;
+        }
+    }
+    if (sd->cyw_function == 2 &&
+        sd->cyw_transfer_offset == sd->cyw_transfer_size) {
+        if (sd->cyw_firmware_started) {
+            cyw_sdio_queue_control_response(sd);
+        } else {
+            memcpy(sd->cyw_rx_queue, sd->cyw_transfer,
+                   sd->cyw_transfer_size);
+            sd->cyw_rx_queue_size = sd->cyw_transfer_size;
+            sd->cyw_rx_queue_offset = 0;
+        }
+    }
+    return count;
+}
+
+static size_t cyw_sdio_read_data(SDState *sd, void *buf, size_t len)
+{
+    uint8_t *bytes = buf;
+    size_t count = MIN(len, sd->cyw_transfer_size -
+                            sd->cyw_transfer_offset);
+
+    for (size_t i = 0; i < count; i++) {
+        uint32_t address = sd->cyw_transfer_address;
+
+        bytes[i] = cyw_sdio_read_byte(sd, sd->cyw_function, address);
+        sd->cyw_transfer_offset++;
+        sd->cyw_rx_bytes++;
+        if (sd->cyw_transfer_increment) {
+            sd->cyw_transfer_address++;
+        }
+    }
+    if (sd->cyw_function == 2 &&
+        sd->cyw_transfer_offset == sd->cyw_transfer_size) {
+        uint32_t available = sd->cyw_rx_queue_size -
+                             sd->cyw_rx_queue_offset;
+
+        sd->cyw_rx_queue_offset += MIN(sd->cyw_transfer_size, available);
+        if (sd->cyw_rx_queue_offset == sd->cyw_rx_queue_size) {
+            sd->cyw_rx_queue_offset = 0;
+            sd->cyw_rx_queue_size = 0;
+            sd->cyw_func1_regs[0x1b] = 0;
+            sd->cyw_func1_regs[0x1c] = 0;
+            if (sd->cyw_link_event_pending) {
+                cyw_sdio_queue_link_event(sd);
+            } else {
+                qemu_flush_queued_packets(qemu_get_queue(sd->cyw_nic));
+            }
+        }
+    }
+    return count;
+}
+
+static bool cyw_sdio_receive_ready(SDState *sd)
+{
+    return sd->cyw_transfer_write &&
+           sd->cyw_transfer_offset < sd->cyw_transfer_size;
+}
+
+static bool cyw_sdio_data_ready(SDState *sd)
+{
+    return !sd->cyw_transfer_write &&
+           sd->cyw_transfer_offset < sd->cyw_transfer_size;
+}
+
+static bool cyw_sdio_get_inserted(SDState *sd)
+{
+    return true;
+}
+
+static bool cyw_sdio_get_readonly(SDState *sd)
+{
+    return false;
+}
+
+static uint8_t cyw_sdio_get_dat_lines(SDState *sd)
+{
+    return sd->cyw_sdio_irq ? 0xd : 0xf;
+}
+
+static bool cyw_sdio_get_cmd_line(SDState *sd)
+{
+    return true;
+}
+
+static void cyw_sdio_set_voltage(SDState *sd, uint16_t millivolts)
+{
+}
+
+static bool cyw_sdio_can_receive(NetClientState *nc)
+{
+    SDState *sd = qemu_get_nic_opaque(nc);
+
+    return sd->cyw_firmware_started &&
+           sd->cyw_rx_queue_size == sd->cyw_rx_queue_offset;
+}
+
+static bool cyw_sdio_inject_packet_drop(SDState *sd, uint8_t direction)
+{
+    bool selected = sd->cyw_packet_drop_direction == direction ||
+                    sd->cyw_packet_drop_direction == CYW_PACKET_DROP_BOTH;
+    bool drop;
+
+    if (!selected) {
+        return false;
+    }
+    drop = sd->cyw_packet_drop_packets_seen >= sd->cyw_packet_drop_after &&
+           sd->cyw_packet_drops_injected < sd->cyw_packet_drop_count;
+    sd->cyw_packet_drop_packets_seen++;
+    if (drop) {
+        sd->cyw_packet_drops_injected++;
+        trace_cyw_sdio_packet_drop(
+            direction, sd->cyw_packet_drop_packets_seen,
+            sd->cyw_packet_drops_injected, sd->cyw_packet_drop_count);
+    }
+    return drop;
+}
+
+static ssize_t cyw_sdio_receive(NetClientState *nc, const uint8_t *buf,
+                                size_t size)
+{
+    SDState *sd = qemu_get_nic_opaque(nc);
+    uint32_t frame_size = CYW_SDPCM_HEADER_SIZE +
+                          CYW_BCDC_HEADER_SIZE + size;
+    uint8_t *bcdc;
+
+    if (!cyw_sdio_can_receive(nc) ||
+        frame_size > sizeof(sd->cyw_rx_queue)) {
+        return 0;
+    }
+    if (cyw_sdio_inject_packet_drop(sd, CYW_PACKET_DROP_RX)) {
+        return size;
+    }
+    stw_le_p(sd->cyw_rx_queue, frame_size);
+    stw_le_p(sd->cyw_rx_queue + 2, (uint16_t)~frame_size);
+    stl_le_p(sd->cyw_rx_queue + 4,
+             sd->cyw_rx_sequence++ |
+             (CYW_SDPCM_DATA_CHANNEL << 8) |
+             (CYW_SDPCM_HEADER_SIZE << 24));
+    stl_le_p(sd->cyw_rx_queue + 8, sd->cyw_tx_sequence_max << 8);
+    bcdc = sd->cyw_rx_queue + CYW_SDPCM_HEADER_SIZE;
+    bcdc[0] = CYW_BCDC_PROTOCOL_VERSION << 4;
+    bcdc[1] = 0;
+    bcdc[2] = 0;
+    bcdc[3] = 0;
+    memcpy(bcdc + CYW_BCDC_HEADER_SIZE, buf, size);
+    sd->cyw_rx_queue_size = frame_size;
+    sd->cyw_rx_queue_offset = 0;
+    sd->cyw_func1_regs[0x1b] = frame_size;
+    sd->cyw_func1_regs[0x1c] = frame_size >> 8;
+    sd->cyw_data_rx_packets++;
+    sd->cyw_intstatus |= CYW_SDIO_I_HMB_FRAME_IND;
+    cyw_sdio_update_irq(sd);
+    return size;
+}
+
+static NetClientInfo cyw_sdio_net_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .can_receive = cyw_sdio_can_receive,
+    .receive = cyw_sdio_receive,
+};
+
+static void cyw_sdio_realize(DeviceState *dev, Error **errp)
+{
+    SDState *sd = CYW43455_SDIO(dev);
+
+    if (sd->cyw_packet_drop_direction > CYW_PACKET_DROP_BOTH) {
+        error_setg(errp,
+                   "packet-drop-direction must be 0 (none), 1 (TX), "
+                   "2 (RX), or 3 (both)");
+        return;
+    }
+    if (sd->cyw_packet_drop_direction != CYW_PACKET_DROP_NONE) {
+        if (sd->cyw_packet_drop_after == UINT64_MAX) {
+            error_setg(errp,
+                       "packet-drop-direction requires packet-drop-after");
+            return;
+        }
+        if (!sd->cyw_packet_drop_count) {
+            error_setg(errp, "packet-drop-count must be nonzero");
+            return;
+        }
+    }
+    sd->cyw_ram_size = CYW_SDIO_DEFAULT_RAM_SIZE;
+    sd->cyw_ram = g_malloc0(sd->cyw_ram_size);
+    qemu_macaddr_default_if_unset(&sd->cyw_nic_conf.macaddr);
+    sd->cyw_nic = qemu_new_nic(
+        &cyw_sdio_net_info, &sd->cyw_nic_conf,
+        object_get_typename(OBJECT(dev)), dev->id,
+        &dev->mem_reentrancy_guard, sd);
+    qemu_format_nic_info_str(
+        qemu_get_queue(sd->cyw_nic), sd->cyw_nic_conf.macaddr.a);
+    cyw_sdio_reset(dev);
+}
+
+static void cyw_sdio_unrealize(DeviceState *dev)
+{
+    SDState *sd = CYW43455_SDIO(dev);
+
+    qemu_del_nic(sd->cyw_nic);
+    sd->cyw_nic = NULL;
+}
+
+static int cyw_sdio_post_load(void *opaque, int version_id)
+{
+    SDState *sd = opaque;
+
+    if (version_id < 2) {
+        for (unsigned int i = 0; i < ARRAY_SIZE(sd->cyw_core_ioctl); i++) {
+            sd->cyw_core_ioctl[i] = CYW_BCMA_IOCTL_CLK;
+            sd->cyw_core_reset[i] = 0;
+        }
+        sd->cyw_armcr4_bankidx = 0;
+    }
+    if (version_id < 3) {
+        sd->cyw_reset_vector = 0;
+        sd->cyw_nvram_size = 0;
+        sd->cyw_start_failures = 0;
+        sd->cyw_reset_vector_valid = false;
+        sd->cyw_firmware_started = false;
+    }
+    if (version_id < 4) {
+        sd->cyw_intstatus = 0;
+        sd->cyw_hostintmask = 0;
+        sd->cyw_tosbmailbox = 0;
+        sd->cyw_tohostmailbox = 0;
+        sd->cyw_tosbmailboxdata = 0;
+        sd->cyw_tohostmailboxdata = 0;
+        sd->cyw_sdio_irq = false;
+    }
+    if (version_id < 5) {
+        memset(sd->cyw_rx_queue, 0, sizeof(sd->cyw_rx_queue));
+        sd->cyw_rx_queue_size = 0;
+        sd->cyw_rx_queue_offset = 0;
+        sd->cyw_control_requests = 0;
+        sd->cyw_control_rejections = 0;
+        sd->cyw_rx_sequence = 0;
+    }
+    if (version_id < 6) {
+        sd->cyw_data_tx_packets = 0;
+        sd->cyw_data_rx_packets = 0;
+    }
+    if (version_id < 7) {
+        sd->cyw_shared_address = 0;
+    }
+    if (version_id < 8) {
+        memset(sd->cyw_transfer + 2048, 0,
+               sizeof(sd->cyw_transfer) - 2048);
+        memset(sd->cyw_rx_queue + 4096, 0,
+               sizeof(sd->cyw_rx_queue) - 4096);
+    }
+    if (version_id < 9) {
+        sd->cyw_link_event_pending = false;
+        sd->cyw_link_event_sent = false;
+        sd->cyw_tx_sequence_max = 0;
+    }
+    if (version_id < 10) {
+        sd->cyw_packet_drop_packets_seen = 0;
+        sd->cyw_packet_drops_injected = 0;
+    }
+    if (sd->cyw_ram_size != CYW_SDIO_DEFAULT_RAM_SIZE ||
+        (sd->cyw_function == 2 &&
+         sd->cyw_transfer_size > sizeof(sd->cyw_transfer)) ||
+        sd->cyw_transfer_offset > sd->cyw_transfer_size ||
+        sd->cyw_function > CYW_SDIO_FUNCTIONS ||
+        sd->cyw_armcr4_bankidx >= CYW_ARMCR4_BANK_COUNT ||
+        sd->cyw_rx_queue_size > sizeof(sd->cyw_rx_queue) ||
+        sd->cyw_rx_queue_offset > sd->cyw_rx_queue_size) {
+        return -EINVAL;
+    }
+    sd->cyw_sdio_irq = false;
+    cyw_sdio_update_irq(sd);
+    return 0;
+}
+
+static void cyw_sdio_get_command_count(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    uint64_t value = CYW43455_SDIO(obj)->cyw_command_count;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_command_failures(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    uint64_t value = CYW43455_SDIO(obj)->cyw_command_failures;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_firmware_bytes(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
+{
+    uint64_t value = CYW43455_SDIO(obj)->cyw_firmware_bytes;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_tx_bytes(Object *obj, Visitor *v,
+                                  const char *name, void *opaque,
+                                  Error **errp)
+{
+    uint64_t value = CYW43455_SDIO(obj)->cyw_tx_bytes;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_rx_bytes(Object *obj, Visitor *v,
+                                  const char *name, void *opaque,
+                                  Error **errp)
+{
+    uint64_t value = CYW43455_SDIO(obj)->cyw_rx_bytes;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_reset_vector(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    uint32_t value = CYW43455_SDIO(obj)->cyw_reset_vector;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_nvram_size(Object *obj, Visitor *v,
+                                    const char *name, void *opaque,
+                                    Error **errp)
+{
+    uint32_t value = CYW43455_SDIO(obj)->cyw_nvram_size;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_start_failures(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
+{
+    uint64_t value = CYW43455_SDIO(obj)->cyw_start_failures;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_shared_address(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
+{
+    uint32_t value = CYW43455_SDIO(obj)->cyw_shared_address;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_firmware_started(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    bool value = CYW43455_SDIO(obj)->cyw_firmware_started;
+
+    visit_type_bool(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_control_requests(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    uint64_t value = CYW43455_SDIO(obj)->cyw_control_requests;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_control_rejections(Object *obj, Visitor *v,
+                                            const char *name, void *opaque,
+                                            Error **errp)
+{
+    uint64_t value = CYW43455_SDIO(obj)->cyw_control_rejections;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_data_tx_packets(Object *obj, Visitor *v,
+                                         const char *name, void *opaque,
+                                         Error **errp)
+{
+    uint64_t value = CYW43455_SDIO(obj)->cyw_data_tx_packets;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_data_rx_packets(Object *obj, Visitor *v,
+                                         const char *name, void *opaque,
+                                         Error **errp)
+{
+    uint64_t value = CYW43455_SDIO(obj)->cyw_data_rx_packets;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_packet_drop_packets_seen(
+    Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
+{
+    uint64_t value = CYW43455_SDIO(obj)->cyw_packet_drop_packets_seen;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void cyw_sdio_get_packet_drops_injected(
+    Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
+{
+    uint32_t value = CYW43455_SDIO(obj)->cyw_packet_drops_injected;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static const Property cyw_sdio_properties[] = {
+    DEFINE_PROP_UINT8("fail-command", SDState, cyw_fail_command, UINT8_MAX),
+    DEFINE_PROP_UINT64("fail-after", SDState, cyw_fail_after, UINT64_MAX),
+    DEFINE_PROP_UINT8("packet-drop-direction", SDState,
+                      cyw_packet_drop_direction, CYW_PACKET_DROP_NONE),
+    DEFINE_PROP_UINT64("packet-drop-after", SDState,
+                       cyw_packet_drop_after, UINT64_MAX),
+    DEFINE_PROP_UINT32("packet-drop-count", SDState,
+                       cyw_packet_drop_count, 1),
+    DEFINE_NIC_PROPERTIES(SDState, cyw_nic_conf),
+};
+
+static const VMStateDescription cyw_sdio_vmstate = {
+    .name = TYPE_CYW43455_SDIO,
+    .version_id = 10,
+    .minimum_version_id = 1,
+    .post_load = cyw_sdio_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(cyw_cccr, SDState, 0x100),
+        VMSTATE_UINT8_ARRAY(cyw_fbr, SDState, 0x300),
+        VMSTATE_UINT8_ARRAY(cyw_func1_regs, SDState, 0x20),
+        VMSTATE_PARTIAL_BUFFER(cyw_transfer, SDState, 2048),
+        VMSTATE_STATIC_BUFFER(cyw_rx_queue, SDState, 5, NULL, 0, 4096),
+        /*
+         * Version 8 carries complete maximum-size CMD53/BCDC buffers.
+         * The legacy prefixes above preserve version 7 stream loading.
+         */
+        VMSTATE_BUFFER_V(cyw_transfer, SDState, 8),
+        VMSTATE_BUFFER_V(cyw_rx_queue, SDState, 8),
+        VMSTATE_UINT32(cyw_transfer_size, SDState),
+        VMSTATE_UINT32(cyw_transfer_offset, SDState),
+        VMSTATE_UINT32(cyw_transfer_address, SDState),
+        VMSTATE_UINT32(cyw_ram_size, SDState),
+        VMSTATE_BUFFER_POINTER_UNSAFE(cyw_ram, SDState, 1,
+                                      CYW_SDIO_DEFAULT_RAM_SIZE),
+        VMSTATE_UINT16(cyw_rca, SDState),
+        VMSTATE_UINT16_ARRAY(cyw_block_size, SDState, 3),
+        VMSTATE_UINT8(cyw_function, SDState),
+        VMSTATE_UINT8(cyw_fail_command, SDState),
+        VMSTATE_BOOL(cyw_selected, SDState),
+        VMSTATE_BOOL(cyw_transfer_write, SDState),
+        VMSTATE_BOOL(cyw_transfer_increment, SDState),
+        VMSTATE_UINT64(cyw_command_count, SDState),
+        VMSTATE_UINT64(cyw_fail_after, SDState),
+        VMSTATE_UINT64(cyw_command_failures, SDState),
+        VMSTATE_UINT64(cyw_firmware_bytes, SDState),
+        VMSTATE_UINT64(cyw_tx_bytes, SDState),
+        VMSTATE_UINT64(cyw_rx_bytes, SDState),
+        VMSTATE_UINT32_ARRAY_V(cyw_core_ioctl, SDState, 4, 2),
+        VMSTATE_UINT32_ARRAY_V(cyw_core_reset, SDState, 4, 2),
+        VMSTATE_UINT32_V(cyw_armcr4_bankidx, SDState, 2),
+        VMSTATE_UINT32_V(cyw_reset_vector, SDState, 3),
+        VMSTATE_UINT32_V(cyw_nvram_size, SDState, 3),
+        VMSTATE_UINT32_V(cyw_shared_address, SDState, 7),
+        VMSTATE_UINT32_V(cyw_intstatus, SDState, 4),
+        VMSTATE_UINT32_V(cyw_hostintmask, SDState, 4),
+        VMSTATE_UINT32_V(cyw_tosbmailbox, SDState, 4),
+        VMSTATE_UINT32_V(cyw_tohostmailbox, SDState, 4),
+        VMSTATE_UINT32_V(cyw_tosbmailboxdata, SDState, 4),
+        VMSTATE_UINT32_V(cyw_tohostmailboxdata, SDState, 4),
+        VMSTATE_UINT32_V(cyw_rx_queue_size, SDState, 5),
+        VMSTATE_UINT32_V(cyw_rx_queue_offset, SDState, 5),
+        VMSTATE_UINT64_V(cyw_start_failures, SDState, 3),
+        VMSTATE_UINT64_V(cyw_control_requests, SDState, 5),
+        VMSTATE_UINT64_V(cyw_control_rejections, SDState, 5),
+        VMSTATE_UINT64_V(cyw_data_tx_packets, SDState, 6),
+        VMSTATE_UINT64_V(cyw_data_rx_packets, SDState, 6),
+        VMSTATE_UINT64_V(cyw_packet_drop_packets_seen, SDState, 10),
+        VMSTATE_UINT32_V(cyw_packet_drops_injected, SDState, 10),
+        VMSTATE_UINT8_V(cyw_rx_sequence, SDState, 5),
+        VMSTATE_UINT8_V(cyw_tx_sequence_max, SDState, 9),
+        VMSTATE_BOOL_V(cyw_reset_vector_valid, SDState, 3),
+        VMSTATE_BOOL_V(cyw_firmware_started, SDState, 3),
+        VMSTATE_BOOL_V(cyw_sdio_irq, SDState, 4),
+        VMSTATE_BOOL_V(cyw_link_event_pending, SDState, 9),
+        VMSTATE_BOOL_V(cyw_link_event_sent, SDState, 9),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static void cyw_sdio_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    SDCardClass *sc = SDMMC_COMMON_CLASS(klass);
+
+    dc->desc = "Infineon CYW43455 SDIO transport";
+    dc->realize = cyw_sdio_realize;
+    dc->unrealize = cyw_sdio_unrealize;
+    dc->vmsd = &cyw_sdio_vmstate;
+    device_class_set_legacy_reset(dc, cyw_sdio_reset);
+    device_class_set_props(dc, cyw_sdio_properties);
+    object_class_property_add(
+        klass, "command-count", "uint64", cyw_sdio_get_command_count,
+        NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "command-failures", "uint64", cyw_sdio_get_command_failures,
+        NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "firmware-bytes", "uint64", cyw_sdio_get_firmware_bytes,
+        NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "tx-bytes", "uint64", cyw_sdio_get_tx_bytes,
+        NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "rx-bytes", "uint64", cyw_sdio_get_rx_bytes,
+        NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "reset-vector", "uint32", cyw_sdio_get_reset_vector,
+        NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "nvram-size", "uint32", cyw_sdio_get_nvram_size,
+        NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "start-failures", "uint64", cyw_sdio_get_start_failures,
+        NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "shared-address", "uint32", cyw_sdio_get_shared_address,
+        NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "firmware-started", "bool", cyw_sdio_get_firmware_started,
+        NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "control-requests", "uint64", cyw_sdio_get_control_requests,
+        NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "control-rejections", "uint64",
+        cyw_sdio_get_control_rejections, NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "data-tx-packets", "uint64", cyw_sdio_get_data_tx_packets,
+        NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "data-rx-packets", "uint64", cyw_sdio_get_data_rx_packets,
+        NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "packet-drop-packets-seen", "uint64",
+        cyw_sdio_get_packet_drop_packets_seen, NULL, NULL, NULL);
+    object_class_property_add(
+        klass, "packet-drops-injected", "uint32",
+        cyw_sdio_get_packet_drops_injected, NULL, NULL, NULL);
+    sc->set_voltage = cyw_sdio_set_voltage;
+    sc->get_dat_lines = cyw_sdio_get_dat_lines;
+    sc->get_cmd_line = cyw_sdio_get_cmd_line;
+    sc->do_command = cyw_sdio_do_command;
+    sc->write_data = cyw_sdio_write_data;
+    sc->read_data = cyw_sdio_read_data;
+    sc->receive_ready = cyw_sdio_receive_ready;
+    sc->data_ready = cyw_sdio_data_ready;
+    sc->get_inserted = cyw_sdio_get_inserted;
+    sc->get_readonly = cyw_sdio_get_readonly;
+}
 
 static void sdmmc_common_class_init(ObjectClass *klass, const void *data)
 {
@@ -3291,6 +5966,54 @@ static void emmc_class_init(ObjectClass *klass, const void *data)
     dc->desc = "eMMC";
     dc->realize = emmc_realize;
     device_class_set_props(dc, emmc_properties);
+    object_class_property_add(klass, "cache-dirty-sectors", "uint32",
+                              emmc_get_cache_dirty_sectors,
+                              NULL, NULL, NULL);
+    object_class_property_set_description(
+        klass, "cache-dirty-sectors",
+        "Number of volatile eMMC write-cache sectors awaiting flush");
+    object_class_property_add_bool(klass, "cache-flush-active",
+                                   emmc_get_cache_flush_active, NULL);
+    object_class_property_set_description(
+        klass, "cache-flush-active",
+        "Whether a timer-driven eMMC cache flush is active");
+    object_class_property_add(klass, "cache-flush-completed-sectors",
+                              "uint64", emmc_get_cache_flush_completed,
+                              NULL, NULL, NULL);
+    object_class_property_set_description(
+        klass, "cache-flush-completed-sectors",
+        "Durable sectors completed by the active or latest timed flush");
+    object_class_property_add_bool(klass, "program-active",
+                                   emmc_get_program_active, NULL);
+    object_class_property_set_description(
+        klass, "program-active",
+        "Whether timer-driven eMMC sector programming is active");
+    object_class_property_add(klass, "program-pending-sectors", "uint32",
+                              emmc_get_program_pending, NULL, NULL, NULL);
+    object_class_property_set_description(
+        klass, "program-pending-sectors",
+        "Number of received eMMC sectors awaiting durable programming");
+    object_class_property_add(klass, "program-completed-sectors",
+                              "uint64", emmc_get_program_completed,
+                              NULL, NULL, NULL);
+    object_class_property_set_description(
+        klass, "program-completed-sectors",
+        "Durable sectors completed by the active or latest timed program");
+    object_class_property_add_bool(klass, "erase-active",
+                                   emmc_get_erase_active, NULL);
+    object_class_property_set_description(
+        klass, "erase-active",
+        "Whether timer-driven eMMC high-capacity erase is active");
+    object_class_property_add(klass, "erase-pending-groups", "uint64",
+                              emmc_get_erase_pending, NULL, NULL, NULL);
+    object_class_property_set_description(
+        klass, "erase-pending-groups",
+        "Number of eMMC high-capacity erase groups awaiting durability");
+    object_class_property_add(klass, "erase-completed-groups", "uint64",
+                              emmc_get_erase_completed, NULL, NULL, NULL);
+    object_class_property_set_description(
+        klass, "erase-completed-groups",
+        "Durable groups completed by the active or latest timed erase");
 
     sc->proto = &sd_proto_emmc;
 
@@ -3323,6 +6046,11 @@ static const TypeInfo sd_types[] = {
         .name           = TYPE_EMMC,
         .parent         = TYPE_SDMMC_COMMON,
         .class_init     = emmc_class_init,
+    },
+    {
+        .name           = TYPE_CYW43455_SDIO,
+        .parent         = TYPE_SDMMC_COMMON,
+        .class_init     = cyw_sdio_class_init,
     },
 };
 

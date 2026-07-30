@@ -90,6 +90,9 @@ DECLARE_INSTANCE_CHECKER(SDState, SD_CARD_SPI, TYPE_SD_CARD_SPI)
 #define TYPE_EMMC "emmc"
 DECLARE_INSTANCE_CHECKER(SDState, EMMC, TYPE_EMMC)
 
+#define TYPE_CYW43455_SDIO "cyw43455-sdio"
+DECLARE_INSTANCE_CHECKER(SDState, CYW43455_SDIO, TYPE_CYW43455_SDIO)
+
 struct SDCardClass {
     /*< private >*/
     DeviceClass parent_class;
@@ -162,6 +165,7 @@ struct SDBusClass {
      */
     void (*set_inserted)(DeviceState *dev, bool inserted);
     void (*set_readonly)(DeviceState *dev, bool readonly);
+    void (*set_sdio_irq)(DeviceState *dev, bool level);
 };
 
 /* Functions to be used by qdevified callers (working via
@@ -234,5 +238,6 @@ void sdbus_reparent_card(SDBus *from, SDBus *to);
 /* Functions to be used by SD devices to report back to qdevified controllers */
 void sdbus_set_inserted(SDBus *sd, bool inserted);
 void sdbus_set_readonly(SDBus *sd, bool inserted);
+void sdbus_set_sdio_irq(SDBus *sd, bool level);
 
 #endif /* HW_SD_H */

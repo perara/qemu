@@ -46,7 +46,7 @@
 #define SDHC_TRNS_ACMD23               0x0008 /* since v3 */
 #define SDHC_TRNS_READ                 0x0010
 #define SDHC_TRNS_MULTI                0x0020
-#define SDHC_TRNMOD_MASK               0x0037
+#define SDHC_TRNMOD_MASK               0x003f
 
 /* R/W Command Register 0x0 */
 #define SDHC_CMDREG                    0x0E
@@ -153,6 +153,8 @@ FIELD(SDHC_TIMEOUTCON, COUNTER,        0, 4);
 /* ROC/RW1C Error Interrupt Status Register 0x0 */
 #define SDHC_ERRINTSTS                 0x32
 #define SDHC_EIS_CMDTIMEOUT            0x0001
+#define SDHC_EIS_DATATIMEOUT           0x0010
+#define SDHC_EIS_DATACRC               0x0020
 #define SDHC_EIS_BLKGAP                0x0004
 #define SDHC_EIS_CMDIDX                0x0008
 #define SDHC_EIS_CMD12ERR              0x0100
@@ -172,8 +174,11 @@ FIELD(SDHC_TIMEOUTCON, COUNTER,        0, 4);
 /* R/W Error Interrupt Status Enable Register 0x0 */
 #define SDHC_ERRINTSTSEN               0x36
 #define SDHC_EISEN_CMDTIMEOUT          0x0001
+#define SDHC_EISEN_DATATIMEOUT         0x0010
+#define SDHC_EISEN_DATACRC             0x0020
 #define SDHC_EISEN_BLKGAP              0x0004
 #define SDHC_EISEN_CMDIDX              0x0008
+#define SDHC_EISEN_CMD12ERR            0x0100
 #define SDHC_EISEN_ADMAERR             0x0200
 
 /* R/W Normal Interrupt Signal Enable Register 0x0 */
@@ -313,7 +318,11 @@ extern const VMStateDescription sdhci_vmstate;
     /* Capabilities registers provide information on supported
      * features of this specific host controller implementation */ \
     DEFINE_PROP_UINT64("capareg", _state, capareg, SDHC_CAPAB_REG_DEFAULT), \
-    DEFINE_PROP_UINT64("maxcurr", _state, maxcurr, 0)
+    DEFINE_PROP_UINT64("maxcurr", _state, maxcurr, 0), \
+    DEFINE_PROP_UINT8("data-error", _state, data_error, 0), \
+    DEFINE_PROP_UINT64("data-error-after", _state, data_error_after, \
+                       UINT64_MAX), \
+    DEFINE_PROP_UINT32("data-error-count", _state, data_error_count, 1)
 
 void sdhci_initfn(SDHCIState *s);
 void sdhci_uninitfn(SDHCIState *s);

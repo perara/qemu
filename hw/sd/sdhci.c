@@ -52,6 +52,68 @@ static inline unsigned int sdhci_get_fifolen(SDHCIState *s)
     return 1 << (9 + FIELD_EX32(s->capareg, SDHC_CAPAB, MAXBLOCKLENGTH));
 }
 
+uint32_t sdhci_get_clock_hz(const SDHCIState *s)
+{
+    uint32_t base_mhz = FIELD_EX64(s->capareg, SDHC_CAPAB, BASECLKFREQ);
+    uint32_t divider;
+    uint64_t base_hz;
+
+    if (!SDHC_CLOCK_IS_ON(s->clkcon) || !base_mhz) {
+        return 0;
+    }
+    base_hz = (uint64_t)base_mhz * 1000 * 1000;
+    divider = ((s->clkcon >> 8) & 0xff) |
+              ((s->clkcon & 0xc0) << 2);
+    return divider ? base_hz / (2 * divider) : base_hz;
+}
+
+bool sdhci_get_high_speed(const SDHCIState *s)
+{
+    return s->hostctl1 & SDHC_CTRL_HIGH_SPEED;
+}
+
+static uint32_t sdhci_apply_boot_clock(SDHCIState *s)
+{
+    uint32_t base_mhz = FIELD_EX64(s->capareg, SDHC_CAPAB, BASECLKFREQ);
+    uint64_t base_hz = (uint64_t)base_mhz * 1000 * 1000;
+    uint32_t divider;
+    uint16_t encoded;
+
+    if (s->boot_high_speed) {
+        s->hostctl1 |= SDHC_CTRL_HIGH_SPEED;
+    } else {
+        s->hostctl1 &= ~SDHC_CTRL_HIGH_SPEED;
+    }
+    if (!base_hz || !s->boot_clock_limit_hz) {
+        s->clkcon &= ~(SDHC_CLOCK_SDCLK_EN | SDHC_CLOCK_INT_EN |
+                       SDHC_CLOCK_INT_STABLE);
+        return 0;
+    }
+    if (base_hz <= s->boot_clock_limit_hz) {
+        divider = 0;
+    } else {
+        divider = DIV_ROUND_UP(
+            base_hz, 2 * (uint64_t)s->boot_clock_limit_hz);
+        if (divider > 0x3ff) {
+            divider = 0x3ff;
+        }
+    }
+    encoded = ((divider & 0xff) << 8) | ((divider & 0x300) >> 2);
+    s->clkcon &= ~0xffc7;
+    s->clkcon |= encoded | SDHC_CLOCK_SDCLK_EN |
+                 SDHC_CLOCK_INT_EN | SDHC_CLOCK_INT_STABLE;
+    return sdhci_get_clock_hz(s);
+}
+
+uint32_t sdhci_configure_boot_clock(SDHCIState *s, bool high_speed,
+                                    uint32_t max_hz)
+{
+    s->boot_clock_configured = max_hz != 0;
+    s->boot_high_speed = high_speed;
+    s->boot_clock_limit_hz = max_hz;
+    return sdhci_apply_boot_clock(s);
+}
+
 /* return true on error */
 static bool sdhci_check_capab_freq_range(SDHCIState *s, const char *desc,
                                          uint8_t freq, Error **errp)
@@ -223,6 +285,8 @@ static bool sdhci_update_irq(SDHCIState *s)
     bool pending = sdhci_slotint(s);
 
     qemu_set_irq(s->irq, pending);
+    qemu_set_irq(s->dma_dreq, !!(s->prnsts &
+                 (SDHC_SPACE_AVAILABLE | SDHC_DATA_AVAILABLE)));
 
     return pending;
 }
@@ -243,6 +307,24 @@ static void sdhci_raise_insertion_irq(void *opaque)
     }
 }
 
+static void sdhci_abort_data_transfer(SDHCIState *s,
+                                      uint16_t error_status,
+                                      uint16_t error_enable)
+{
+    timer_del(s->transfer_timer);
+    s->data_count = 0;
+    s->stopped_state = sdhc_not_stopped;
+    s->prnsts &= ~(SDHC_DOING_READ | SDHC_DOING_WRITE |
+                   SDHC_DAT_LINE_ACTIVE | SDHC_DATA_INHIBIT |
+                   SDHC_SPACE_AVAILABLE | SDHC_DATA_AVAILABLE);
+    s->norintsts &= ~(SDHC_NIS_TRSCMP | SDHC_NIS_DMA |
+                      SDHC_NIS_WBUFRDY | SDHC_NIS_RBUFRDY);
+    if (s->errintstsen & error_enable) {
+        s->errintsts |= error_status;
+        s->norintsts |= SDHC_NIS_ERR;
+    }
+}
+
 static void sdhci_set_inserted(DeviceState *dev, bool level)
 {
     SDHCIState *s = (SDHCIState *)dev;
@@ -259,6 +341,13 @@ static void sdhci_set_inserted(DeviceState *dev, bool level)
                 s->norintsts |= SDHC_NIS_INSERT;
             }
         } else {
+            if (timer_pending(s->transfer_timer) ||
+                (s->prnsts & (SDHC_DOING_READ | SDHC_DOING_WRITE |
+                              SDHC_DAT_LINE_ACTIVE |
+                              SDHC_DATA_INHIBIT))) {
+                sdhci_abort_data_transfer(s, SDHC_EIS_DATATIMEOUT,
+                                          SDHC_EISEN_DATATIMEOUT);
+            }
             s->prnsts = 0x1fa0000;
             s->pwrcon &= ~SDHC_POWER_ON;
             s->clkcon &= ~SDHC_CLOCK_SDCLK_EN;
@@ -286,6 +375,19 @@ static void sdhci_set_readonly(DeviceState *dev, bool level)
     }
 }
 
+static void sdhci_set_sdio_irq(DeviceState *dev, bool level)
+{
+    SDHCIState *s = (SDHCIState *)dev;
+
+    s->sdio_irq_level = level;
+    if (level && s->norintstsen & SDHC_NISEN_CARDINT) {
+        s->norintsts |= SDHC_NIS_CARDINT;
+    } else if (!level) {
+        s->norintsts &= ~SDHC_NIS_CARDINT;
+    }
+    sdhci_update_irq(s);
+}
+
 static void sdhci_reset(SDHCIState *s)
 {
     DeviceState *dev = DEVICE(s);
@@ -307,6 +409,10 @@ static void sdhci_reset(SDHCIState *s)
     s->data_count = 0;
     s->stopped_state = sdhc_not_stopped;
     s->pending_insert_state = false;
+    s->sdio_irq_level = false;
+    if (s->boot_clock_configured) {
+        sdhci_apply_boot_clock(s);
+    }
     if (object_dynamic_cast(OBJECT(s), TYPE_FSL_ESDHC_BE) ||
             object_dynamic_cast(OBJECT(s), TYPE_FSL_ESDHC_LE)) {
         s->norintstsen = 0x013f;
@@ -334,6 +440,84 @@ static void sdhci_data_transfer(void *opaque);
 
 #define BLOCK_SIZE_MASK (4 * KiB - 1)
 
+static bool sdhci_inject_data_error(SDHCIState *s)
+{
+    uint16_t error_status;
+    uint16_t error_enable;
+
+    if (s->data_error == SDHCI_DATA_ERROR_NONE ||
+        s->data_errors_injected >= s->data_error_count ||
+        s->data_bytes_transferred < s->data_error_after) {
+        return false;
+    }
+
+    if (s->data_error == SDHCI_DATA_ERROR_TIMEOUT) {
+        error_status = SDHC_EIS_DATATIMEOUT;
+        error_enable = SDHC_EISEN_DATATIMEOUT;
+    } else {
+        error_status = SDHC_EIS_DATACRC;
+        error_enable = SDHC_EISEN_DATACRC;
+    }
+    s->data_errors_injected++;
+    trace_sdhci_data_error(s->data_error, s->data_bytes_transferred,
+                           s->data_errors_injected, s->data_error_count);
+    sdhci_abort_data_transfer(s, error_status, error_enable);
+    sdhci_update_irq(s);
+    return true;
+}
+
+static bool sdhci_read_card_data(SDHCIState *s, uint8_t *buffer,
+                                 uint32_t length)
+{
+    if (sdhci_inject_data_error(s)) {
+        return false;
+    }
+    sdbus_read_data(&s->sdbus, buffer, length);
+    if (s->data_error != SDHCI_DATA_ERROR_NONE) {
+        s->data_bytes_transferred += length;
+    }
+    return true;
+}
+
+static bool sdhci_write_card_data(SDHCIState *s, const uint8_t *buffer,
+                                  uint32_t length)
+{
+    if (sdhci_inject_data_error(s)) {
+        return false;
+    }
+    sdbus_write_data(&s->sdbus, buffer, length);
+    if (s->data_error != SDHCI_DATA_ERROR_NONE) {
+        s->data_bytes_transferred += length;
+    }
+    return true;
+}
+
+static bool sdhci_send_auto_cmd23(SDHCIState *s)
+{
+    SDRequest request = {
+        .cmd = 23,
+        .arg = s->sdmasysad,
+    };
+    uint8_t response[16];
+    size_t rlen;
+
+    trace_sdhci_auto_command(request.cmd, request.arg);
+    rlen = sdbus_do_command(&s->sdbus, &request, response,
+                            sizeof(response));
+    if (rlen == 4) {
+        return true;
+    }
+
+    trace_sdhci_error("timeout waiting for Auto CMD23 response");
+    s->acmd12errsts |= R_SDHC_ACMD12ERRSTS_TIMEOUT_ERR_MASK;
+    if (s->errintstsen & SDHC_EISEN_CMD12ERR) {
+        s->errintsts |= SDHC_EIS_CMD12ERR;
+        s->norintsts |= SDHC_NIS_ERR;
+    }
+    sdhci_update_irq(s);
+    return false;
+}
+
 static void sdhci_send_command(SDHCIState *s)
 {
     SDRequest request;
@@ -345,6 +529,13 @@ static void sdhci_send_command(SDHCIState *s)
     s->acmd12errsts = 0;
     request.cmd = s->cmdreg >> 8;
     request.arg = s->argument;
+
+    if ((s->trnmod & SDHC_TRNS_ACMD23) &&
+        (s->trnmod & SDHC_TRNS_MULTI) &&
+        (request.cmd == 18 || request.cmd == 25) &&
+        !sdhci_send_auto_cmd23(s)) {
+        return;
+    }
 
     trace_sdhci_send_command(request.cmd, request.arg);
     rlen = sdbus_do_command(&s->sdbus, &request, response, sizeof(response));
@@ -433,7 +624,9 @@ static void sdhci_read_block_from_card(SDHCIState *s)
 
     if (!FIELD_EX32(s->hostctl2, SDHC_HOSTCTL2, EXECUTE_TUNING)) {
         /* Device is not in tuning */
-        sdbus_read_data(&s->sdbus, s->fifo_buffer, blk_size);
+        if (!sdhci_read_card_data(s, s->fifo_buffer, blk_size)) {
+            return;
+        }
     }
 
     if (FIELD_EX32(s->hostctl2, SDHC_HOSTCTL2, EXECUTE_TUNING)) {
@@ -535,7 +728,10 @@ static void sdhci_write_block_to_card(SDHCIState *s)
         }
     }
 
-    sdbus_write_data(&s->sdbus, s->fifo_buffer, s->blksize & BLOCK_SIZE_MASK);
+    if (!sdhci_write_card_data(s, s->fifo_buffer,
+                               s->blksize & BLOCK_SIZE_MASK)) {
+        return;
+    }
 
     /* Next data can be written through BUFFER DATORT register */
     s->prnsts |= SDHC_SPACE_AVAILABLE;
@@ -624,7 +820,9 @@ static void sdhci_sdma_transfer_multi_blocks(SDHCIState *s)
         s->prnsts |= SDHC_DOING_READ;
         while (s->blkcnt) {
             if (s->data_count == 0) {
-                sdbus_read_data(&s->sdbus, s->fifo_buffer, block_size);
+                if (!sdhci_read_card_data(s, s->fifo_buffer, block_size)) {
+                    return;
+                }
             }
             begin = s->data_count;
             if (((boundary_count + begin) < block_size) && page_aligned) {
@@ -662,7 +860,9 @@ static void sdhci_sdma_transfer_multi_blocks(SDHCIState *s)
                             s->data_count - begin, MEMTXATTRS_UNSPECIFIED);
             s->sdmasysad += s->data_count - begin;
             if (s->data_count == block_size) {
-                sdbus_write_data(&s->sdbus, s->fifo_buffer, block_size);
+                if (!sdhci_write_card_data(s, s->fifo_buffer, block_size)) {
+                    return;
+                }
                 s->data_count = 0;
                 if (s->trnmod & SDHC_TRNS_BLK_CNT_EN) {
                     s->blkcnt--;
@@ -691,13 +891,17 @@ static void sdhci_sdma_transfer_single_block(SDHCIState *s)
     uint32_t datacnt = s->blksize & BLOCK_SIZE_MASK;
 
     if (s->trnmod & SDHC_TRNS_READ) {
-        sdbus_read_data(&s->sdbus, s->fifo_buffer, datacnt);
+        if (!sdhci_read_card_data(s, s->fifo_buffer, datacnt)) {
+            return;
+        }
         dma_memory_write(s->dma_as, s->sdmasysad, s->fifo_buffer, datacnt,
                          MEMTXATTRS_UNSPECIFIED);
     } else {
         dma_memory_read(s->dma_as, s->sdmasysad, s->fifo_buffer, datacnt,
                         MEMTXATTRS_UNSPECIFIED);
-        sdbus_write_data(&s->sdbus, s->fifo_buffer, datacnt);
+        if (!sdhci_write_card_data(s, s->fifo_buffer, datacnt)) {
+            return;
+        }
     }
     s->blkcnt--;
 
@@ -818,7 +1022,10 @@ static void sdhci_do_adma(SDHCIState *s)
                 s->prnsts |= SDHC_DOING_READ;
                 while (length) {
                     if (s->data_count == 0) {
-                        sdbus_read_data(&s->sdbus, s->fifo_buffer, block_size);
+                        if (!sdhci_read_card_data(s, s->fifo_buffer,
+                                                 block_size)) {
+                            return;
+                        }
                     }
                     begin = s->data_count;
                     if ((length + begin) < block_size) {
@@ -866,7 +1073,10 @@ static void sdhci_do_adma(SDHCIState *s)
                     }
                     dscr.addr += s->data_count - begin;
                     if (s->data_count == block_size) {
-                        sdbus_write_data(&s->sdbus, s->fifo_buffer, block_size);
+                        if (!sdhci_write_card_data(s, s->fifo_buffer,
+                                                  block_size)) {
+                            return;
+                        }
                         s->data_count = 0;
                         if (s->trnmod & SDHC_TRNS_BLK_CNT_EN) {
                             s->blkcnt--;
@@ -1302,6 +1512,9 @@ sdhci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
         MASKED_WRITE(s->errintstsen, mask >> 16, value >> 16);
         s->norintsts &= s->norintstsen;
         s->errintsts &= s->errintstsen;
+        if (s->sdio_irq_level && s->norintstsen & SDHC_NISEN_CARDINT) {
+            s->norintsts |= SDHC_NIS_CARDINT;
+        }
         if (s->errintsts) {
             s->norintsts |= SDHC_NIS_ERR;
         } else {
@@ -1409,7 +1622,16 @@ static void sdhci_init_readonly_registers(SDHCIState *s, Error **errp)
 
 void sdhci_initfn(SDHCIState *s)
 {
+    Object *obj = OBJECT(s);
+
     qbus_init(&s->sdbus, sizeof(s->sdbus), TYPE_SDHCI_BUS, DEVICE(s), "sd-bus");
+
+    object_property_add_uint64_ptr(obj, "data-bytes-transferred",
+                                   &s->data_bytes_transferred,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint32_ptr(obj, "data-errors-injected",
+                                   &s->data_errors_injected,
+                                   OBJ_PROP_FLAG_READ);
 
     s->insert_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                    sdhci_raise_insertion_irq, s);
@@ -1431,6 +1653,26 @@ void sdhci_uninitfn(SDHCIState *s)
 void sdhci_common_realize(SDHCIState *s, Error **errp)
 {
     ERRP_GUARD();
+
+    if (s->data_error > SDHCI_DATA_ERROR_CRC) {
+        error_setg(errp, "data-error must be 0 (none), 1 (timeout), or "
+                   "2 (CRC)");
+        return;
+    }
+    if (s->data_error != SDHCI_DATA_ERROR_NONE) {
+        if (s->data_error_after == UINT64_MAX) {
+            error_setg(errp, "data-error requires data-error-after");
+            return;
+        }
+        if (!QEMU_IS_ALIGNED(s->data_error_after, 512)) {
+            error_setg(errp, "data-error-after must be 512-byte aligned");
+            return;
+        }
+        if (!s->data_error_count) {
+            error_setg(errp, "data-error-count must be nonzero");
+            return;
+        }
+    }
 
     sdhci_init_readonly_registers(s, errp);
     if (*errp) {
@@ -1475,6 +1717,44 @@ static const VMStateDescription sdhci_pending_insert_vmstate = {
     },
 };
 
+static bool sdhci_sdio_irq_vmstate_needed(void *opaque)
+{
+    SDHCIState *s = opaque;
+
+    return s->sdio_irq_level;
+}
+
+static const VMStateDescription sdhci_sdio_irq_vmstate = {
+    .name = "sdhci/sdio-irq",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = sdhci_sdio_irq_vmstate_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(sdio_irq_level, SDHCIState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool sdhci_data_error_vmstate_needed(void *opaque)
+{
+    SDHCIState *s = opaque;
+
+    return s->data_error != SDHCI_DATA_ERROR_NONE &&
+           (s->data_bytes_transferred || s->data_errors_injected);
+}
+
+static const VMStateDescription sdhci_data_error_vmstate = {
+    .name = "sdhci/data-error",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = sdhci_data_error_vmstate_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(data_bytes_transferred, SDHCIState),
+        VMSTATE_UINT32(data_errors_injected, SDHCIState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 const VMStateDescription sdhci_vmstate = {
     .name = "sdhci",
     .version_id = 1,
@@ -1512,6 +1792,8 @@ const VMStateDescription sdhci_vmstate = {
     },
     .subsections = (const VMStateDescription * const []) {
         &sdhci_pending_insert_vmstate,
+        &sdhci_sdio_irq_vmstate,
+        &sdhci_data_error_vmstate,
         NULL
     },
 };
@@ -1542,6 +1824,7 @@ static void sdhci_sysbus_init(Object *obj)
     SDHCIState *s = SYSBUS_SDHCI(obj);
 
     sdhci_initfn(s);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->dma_dreq, "dma-dreq", 1);
 }
 
 static void sdhci_sysbus_finalize(Object *obj)
@@ -1605,6 +1888,7 @@ static void sdhci_bus_class_init(ObjectClass *klass, const void *data)
 
     sbc->set_inserted = sdhci_set_inserted;
     sbc->set_readonly = sdhci_set_readonly;
+    sbc->set_sdio_irq = sdhci_set_sdio_irq;
 }
 
 /* --- qdev i.MX eSDHC --- */

@@ -49,6 +49,7 @@ struct SDHCIState {
     QEMUTimer *insert_timer;       /* timer for 'changing' sd card. */
     QEMUTimer *transfer_timer;
     qemu_irq irq;
+    qemu_irq dma_dreq;
 
     /* Registers cleared on reset */
     uint32_t sdmasysad;    /* SDMA System Address register */
@@ -87,6 +88,7 @@ struct SDHCIState {
     uint16_t data_count;   /* current element in FIFO buffer */
     uint8_t  stopped_state;/* Current SDHC state */
     bool     pending_insert_state;
+    bool     sdio_irq_level;
     /* Buffer Data Port Register - virtual access point to R and W buffers */
     /* Software Reset Register - always reads as 0 */
     /* Force Event Auto CMD12 Error Interrupt Reg - write only */
@@ -98,6 +100,14 @@ struct SDHCIState {
     uint32_t quirks;
     uint8_t sd_spec_version;
     uint8_t uhs_mode;
+    uint8_t data_error;
+    uint64_t data_error_after;
+    uint32_t data_error_count;
+    uint64_t data_bytes_transferred;
+    uint32_t data_errors_injected;
+    bool boot_clock_configured;
+    bool boot_high_speed;
+    uint32_t boot_clock_limit_hz;
     /*
      * Write Protect pin default active low for detecting SD card
      * to be protected. Set wp_inverted to invert the signal.
@@ -114,6 +124,20 @@ typedef struct SDHCIState SDHCIState;
  * original bit number is preserved
  */
 #define SDHCI_QUIRK_NO_BUSY_IRQ    BIT(14)
+
+#define SDHCI_DATA_ERROR_NONE      0
+#define SDHCI_DATA_ERROR_TIMEOUT   1
+#define SDHCI_DATA_ERROR_CRC       2
+
+/*
+ * Configure and inspect the controller state left by board firmware before
+ * guest ownership.  max_hz is a ceiling; the returned clock is the fastest
+ * representable divider which does not exceed it.
+ */
+uint32_t sdhci_configure_boot_clock(SDHCIState *s, bool high_speed,
+                                    uint32_t max_hz);
+uint32_t sdhci_get_clock_hz(const SDHCIState *s);
+bool sdhci_get_high_speed(const SDHCIState *s);
 
 #define TYPE_PCI_SDHCI "sdhci-pci"
 DECLARE_INSTANCE_CHECKER(SDHCIState, PCI_SDHCI,

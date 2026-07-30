@@ -30,6 +30,8 @@ struct BCM2835SDHostState {
 
     uint32_t cmd;
     uint32_t cmdarg;
+    uint32_t timeout;
+    uint32_t cdiv;
     uint32_t status;
     uint32_t rsp[4];
     uint32_t config;

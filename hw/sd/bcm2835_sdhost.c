@@ -155,6 +155,7 @@ static void bcm2835_sdhost_fifo_push(BCM2835SDHostState *s, uint32_t value)
 
     if (s->fifo_len == BCM2835_SDHOST_FIFO_LEN) {
         /* FIFO overflow */
+        s->status |= SDHSTS_FIFO_ERROR;
         return;
     }
     n = (s->fifo_pos + s->fifo_len) & (BCM2835_SDHOST_FIFO_LEN - 1);
@@ -168,6 +169,7 @@ static uint32_t bcm2835_sdhost_fifo_pop(BCM2835SDHostState *s)
 
     if (s->fifo_len == 0) {
         /* FIFO underflow */
+        s->status |= SDHSTS_FIFO_ERROR;
         return 0;
     }
     value = s->fifo[s->fifo_pos];
@@ -265,6 +267,12 @@ static uint64_t bcm2835_sdhost_read(void *opaque, hwaddr offset,
     case SDHSTS:
         res = s->status;
         break;
+    case SDTOUT:
+        res = s->timeout;
+        break;
+    case SDCDIV:
+        res = s->cdiv;
+        break;
     case SDRSP0:
         res = s->rsp[0];
         break;
@@ -323,8 +331,10 @@ static void bcm2835_sdhost_write(void *opaque, hwaddr offset,
         }
         break;
     case SDTOUT:
+        s->timeout = value;
         break;
     case SDCDIV:
+        s->cdiv = value & SDCDIV_MAX_CDIV;
         break;
     case SDHSTS:
         s->status &= ~value;
@@ -346,7 +356,7 @@ static void bcm2835_sdhost_write(void *opaque, hwaddr offset,
         bcm2835_sdhost_fifo_run(s);
         break;
     case SDVDD:
-        s->vdd = value;
+        s->vdd = value & 1;
         break;
     case SDDATA:
         bcm2835_sdhost_fifo_push(s, value);
@@ -376,11 +386,13 @@ static const MemoryRegionOps bcm2835_sdhost_ops = {
 
 static const VMStateDescription vmstate_bcm2835_sdhost = {
     .name = TYPE_BCM2835_SDHOST,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(cmd, BCM2835SDHostState),
         VMSTATE_UINT32(cmdarg, BCM2835SDHostState),
+        VMSTATE_UINT32_V(timeout, BCM2835SDHostState, 2),
+        VMSTATE_UINT32_V(cdiv, BCM2835SDHostState, 2),
         VMSTATE_UINT32(status, BCM2835SDHostState),
         VMSTATE_UINT32_ARRAY(rsp, BCM2835SDHostState, 4),
         VMSTATE_UINT32(config, BCM2835SDHostState),
@@ -415,14 +427,21 @@ static void bcm2835_sdhost_reset(DeviceState *dev)
 
     s->cmd = 0;
     s->cmdarg = 0;
+    s->timeout = 0;
+    s->cdiv = 0;
+    s->status = 0;
+    memset(s->rsp, 0, sizeof(s->rsp));
     s->edm = 0x0000c60f;
     trace_bcm2835_sdhost_edm_change("device reset", s->edm);
     s->config = 0;
+    s->vdd = 0;
     s->hbct = 0;
     s->hblc = 0;
     s->datacnt = 0;
     s->fifo_pos = 0;
     s->fifo_len = 0;
+    memset(s->fifo, 0, sizeof(s->fifo));
+    qemu_set_irq(s->irq, 0);
 }
 
 static void bcm2835_sdhost_class_init(ObjectClass *klass, const void *data)

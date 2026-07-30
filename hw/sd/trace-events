@@ -24,7 +24,9 @@ sdbus_get_cmd_line(const char *bus_name, bool cmd_line) "@%s cmd_line: %u"
 # sdhci.c
 sdhci_set_inserted(const char *level) "card state changed: %s"
 sdhci_send_command(uint8_t cmd, uint32_t arg) "CMD%02u ARG[0x%08x]"
+sdhci_auto_command(uint8_t cmd, uint32_t arg) "CMD%02u ARG[0x%08x]"
 sdhci_error(const char *msg) "%s"
+sdhci_data_error(uint8_t kind, uint64_t bytes, uint32_t injected, uint32_t count) "injected kind=%u after=%" PRIu64 " bytes, occurrence=%u/%u"
 sdhci_response4(uint32_t r0) "RSPREG[31..0]=0x%08x"
 sdhci_response16(uint32_t r3, uint32_t r2, uint32_t r1, uint32_t r0) "RSPREG[127..96]=0x%08x, RSPREG[95..64]=0x%08x, RSPREG[63..32]=0x%08x, RSPREG[31..0]=0x%08x"
 sdhci_end_transfer(uint8_t cmd, uint32_t arg) "Automatically issue CMD%02u 0x%08x"
@@ -61,6 +63,15 @@ sdcard_ext_csd_update(unsigned index, uint8_t oval, uint8_t nval) "index %u: 0x%
 sdcard_switch(unsigned access, unsigned index, unsigned value, unsigned set) "acc:%u idx:%u val:%u set:%u"
 sdcard_rpmb_read_block(uint16_t resp, uint16_t read_addr, uint16_t result) "resp 0x%x read_addr 0x%x result 0x%x"
 sdcard_rpmb_write_block(uint16_t req, uint16_t result) "req 0x%x result 0x%x"
+cyw_sdio_command(uint8_t cmd, uint32_t arg, uint64_t count) "CMD%02u arg 0x%08x count %" PRIu64
+cyw_sdio_irq(bool level, uint32_t intstatus, uint32_t hostintmask, uint8_t int_enable) "level %d intstatus 0x%08x hostintmask 0x%08x int-enable 0x%02x"
+cyw_sdio_control(uint16_t frame_size, uint32_t transfer_size, uint8_t data_offset, uint32_t command, uint32_t flags) "frame-size %u transfer-size %u data-offset %u command %u flags 0x%08x"
+cyw_sdio_control_reject(unsigned int reason, uint16_t frame_size, uint32_t transfer_size, uint8_t data_offset, uint32_t queue_size, uint32_t queue_offset) "reason %u frame-size %u transfer-size %u data-offset %u queue-size %u queue-offset %u"
+cyw_sdio_control_header(uint32_t hw_header, uint32_t sw_header, uint32_t sw_header2, uint32_t dcmd) "hw 0x%08x sw 0x%08x sw2 0x%08x dcmd 0x%08x"
+cyw_sdio_runtime_ram_write(uint32_t address) "address 0x%08x"
+cyw_sdio_link_event(uint32_t frame_size) "frame-size %u"
+cyw_sdio_iovar(const char *name, bool set) "name %s set %d"
+cyw_sdio_packet_drop(uint8_t direction, uint64_t seen, uint32_t injected, uint32_t count) "direction=%u seen=%" PRIu64 " occurrence=%u/%u"
 
 # pl181.c
 pl181_command_send(uint8_t cmd, uint32_t arg) "sending CMD%02d arg 0x%08" PRIx32
