@@ -89,6 +89,153 @@ static void test_i2c_read_write(gconstpointer data)
 
 }
 
+static void test_i2c_control_error_reset(gconstpointer data)
+{
+    intptr_t index = (intptr_t)data;
+    uint32_t base_addr = bsc_base_addrs[index];
+    uint32_t status;
+
+    writel(base_addr + BCM2835_I2C_S, BCM2835_I2C_S_DONE |
+                                      BCM2835_I2C_S_ERR |
+                                      BCM2835_I2C_S_CLKT);
+
+    /* Architectural field masks and one-shot command bits. */
+    writel(base_addr + BCM2835_I2C_A, 0xd1);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_A), ==, 0x51);
+    writel(base_addr + BCM2835_I2C_DLEN, 0x10001);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_DLEN), ==, 1);
+    writel(base_addr + BCM2835_I2C_DIV, 0x12345678);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_DIV), ==, 0x5678);
+    writel(base_addr + BCM2835_I2C_DEL, 0x12345678);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_DEL), ==, 0x12345678);
+    writel(base_addr + BCM2835_I2C_CLKT, 0x10040);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_CLKT), ==, 0x40);
+
+    /* Neither ST without I2CEN nor I2CEN without ST starts a transfer. */
+    writel(base_addr + BCM2835_I2C_C,
+           BCM2835_I2C_C_ST | BCM2835_I2C_C_INTD);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_C), ==,
+                    BCM2835_I2C_C_INTD);
+    status = readl(base_addr + BCM2835_I2C_S);
+    g_assert_false(status & (BCM2835_I2C_S_TA | BCM2835_I2C_S_DONE |
+                             BCM2835_I2C_S_ERR));
+
+    writel(base_addr + BCM2835_I2C_C,
+           BCM2835_I2C_C_I2CEN | BCM2835_I2C_C_INTD);
+    status = readl(base_addr + BCM2835_I2C_S);
+    g_assert_false(status & (BCM2835_I2C_S_TA | BCM2835_I2C_S_DONE |
+                             BCM2835_I2C_S_ERR));
+
+    /* An address NACK completes with ERR|DONE and never remains active. */
+    writel(base_addr + BCM2835_I2C_C,
+           BCM2835_I2C_C_I2CEN | BCM2835_I2C_C_INTD |
+           BCM2835_I2C_C_ST | BCM2835_I2C_C_CLEAR);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_C), ==,
+                    BCM2835_I2C_C_I2CEN | BCM2835_I2C_C_INTD);
+    status = readl(base_addr + BCM2835_I2C_S);
+    g_assert_true(status & BCM2835_I2C_S_DONE);
+    g_assert_true(status & BCM2835_I2C_S_ERR);
+    g_assert_false(status & BCM2835_I2C_S_TA);
+
+    writel(base_addr + BCM2835_I2C_S,
+           BCM2835_I2C_S_DONE | BCM2835_I2C_S_ERR);
+    status = readl(base_addr + BCM2835_I2C_S);
+    g_assert_false(status & (BCM2835_I2C_S_DONE | BCM2835_I2C_S_ERR));
+
+    /* Reset terminates any live bus transaction and restores all registers. */
+    writel(base_addr + BCM2835_I2C_A, 0x50);
+    writel(base_addr + BCM2835_I2C_DLEN, 1);
+    writel(base_addr + BCM2835_I2C_C,
+           BCM2835_I2C_C_I2CEN | BCM2835_I2C_C_INTT |
+           BCM2835_I2C_C_ST);
+    g_assert_true(readl(base_addr + BCM2835_I2C_S) & BCM2835_I2C_S_TA);
+    qtest_system_reset(global_qtest);
+
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_C), ==, 0);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_DLEN), ==, 0);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_A), ==, 0);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_DIV), ==, 0x5dc);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_DEL), ==, 0x00300030);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_CLKT), ==, 0x40);
+    status = readl(base_addr + BCM2835_I2C_S);
+    g_assert_cmphex(status, ==,
+                    BCM2835_I2C_S_TXD | BCM2835_I2C_S_TXE);
+}
+
+static void test_i2c_ten_bit_addressing(void)
+{
+    uint32_t base_addr = bsc_base_addrs[0];
+    uint32_t status;
+
+    /* 10-bit address 0x2aa uses 1111010 in A and 0xaa in the FIFO. */
+    writel(base_addr + BCM2835_I2C_A, 0x7a);
+    writel(base_addr + BCM2835_I2C_DLEN, 4);
+    bcm2835_i2c_init_transfer(base_addr, false);
+    writel(base_addr + BCM2835_I2C_FIFO, 0xaa);
+    writel(base_addr + BCM2835_I2C_FIFO, TMP105_REG_T_HIGH);
+    writel(base_addr + BCM2835_I2C_FIFO, 0xde);
+    writel(base_addr + BCM2835_I2C_FIFO, 0xad);
+    status = readl(base_addr + BCM2835_I2C_S);
+    g_assert_true(status & BCM2835_I2C_S_DONE);
+    g_assert_false(status & (BCM2835_I2C_S_ERR | BCM2835_I2C_S_TA));
+
+    writel(base_addr + BCM2835_I2C_S,
+           BCM2835_I2C_S_DONE | BCM2835_I2C_S_ERR);
+
+    /* Select the register through the documented 10-bit write phase. */
+    writel(base_addr + BCM2835_I2C_DLEN, 2);
+    bcm2835_i2c_init_transfer(base_addr, false);
+    writel(base_addr + BCM2835_I2C_FIFO, 0xaa);
+    writel(base_addr + BCM2835_I2C_FIFO, TMP105_REG_T_HIGH);
+    g_assert_true(readl(base_addr + BCM2835_I2C_S) & BCM2835_I2C_S_DONE);
+
+    writel(base_addr + BCM2835_I2C_S, BCM2835_I2C_S_DONE);
+    writel(base_addr + BCM2835_I2C_DLEN, 2);
+    bcm2835_i2c_init_transfer(base_addr, true);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_FIFO), ==, 0xde);
+    g_assert_cmphex(readl(base_addr + BCM2835_I2C_FIFO), ==, 0xa0);
+
+    /* A different low address byte must NACK and terminate cleanly. */
+    writel(base_addr + BCM2835_I2C_S,
+           BCM2835_I2C_S_DONE | BCM2835_I2C_S_ERR);
+    writel(base_addr + BCM2835_I2C_DLEN, 1);
+    bcm2835_i2c_init_transfer(base_addr, false);
+    writel(base_addr + BCM2835_I2C_FIFO, 0xab);
+    status = readl(base_addr + BCM2835_I2C_S);
+    g_assert_true(status & BCM2835_I2C_S_DONE);
+    g_assert_true(status & BCM2835_I2C_S_ERR);
+    g_assert_false(status & BCM2835_I2C_S_TA);
+}
+
+static void test_i2c_data_nack(void)
+{
+    uint32_t base_addr = bsc_base_addrs[0];
+    uint32_t status;
+
+    writel(base_addr + BCM2835_I2C_S,
+           BCM2835_I2C_S_DONE | BCM2835_I2C_S_ERR);
+    writel(base_addr + BCM2835_I2C_A, 0x53);
+    writel(base_addr + BCM2835_I2C_DLEN, 3);
+    bcm2835_i2c_init_transfer(base_addr, false);
+    writel(base_addr + BCM2835_I2C_FIFO, TMP105_REG_T_HIGH);
+    writel(base_addr + BCM2835_I2C_FIFO, 0xde);
+    status = readl(base_addr + BCM2835_I2C_S);
+    g_assert_true(status & BCM2835_I2C_S_DONE);
+    g_assert_true(status & BCM2835_I2C_S_ERR);
+    g_assert_false(status & BCM2835_I2C_S_TA);
+
+    /* STOP resets the target transaction and a different device recovers. */
+    writel(base_addr + BCM2835_I2C_S,
+           BCM2835_I2C_S_DONE | BCM2835_I2C_S_ERR);
+    writel(base_addr + BCM2835_I2C_A, 0x50);
+    writel(base_addr + BCM2835_I2C_DLEN, 1);
+    bcm2835_i2c_init_transfer(base_addr, false);
+    writel(base_addr + BCM2835_I2C_FIFO, TMP105_REG_T_HIGH);
+    status = readl(base_addr + BCM2835_I2C_S);
+    g_assert_true(status & BCM2835_I2C_S_DONE);
+    g_assert_false(status & BCM2835_I2C_S_ERR);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -98,14 +245,28 @@ int main(int argc, char **argv)
 
     for (i = 0; i < 3; i++) {
         g_autofree char *test_name =
-        g_strdup_printf("/bcm2835/bcm2835-i2c%d/read_write", i);
+            g_strdup_printf("/bcm2835/bcm2835-i2c%d/read_write", i);
+        g_autofree char *contract_test_name =
+            g_strdup_printf(
+                "/bcm2835/bcm2835-i2c%d/control_error_reset", i);
+
         qtest_add_data_func(test_name, (void *)(intptr_t) i,
                             test_i2c_read_write);
+        qtest_add_data_func(contract_test_name, (void *)(intptr_t)i,
+                            test_i2c_control_error_reset);
     }
+    qtest_add_func("/bcm2835/bcm2835-i2c0/ten-bit-addressing",
+                   test_i2c_ten_bit_addressing);
+    qtest_add_func("/bcm2835/bcm2835-i2c0/data-nack",
+                   test_i2c_data_nack);
 
     /* Run I2C tests with TMP105 slaves on all three buses */
     qtest_start("-M raspi3b "
                 "-device tmp105,address=0x50,bus=i2c-bus.0 "
+                "-device tmp105,address=0x52,ten-bit-address=0x2aa,"
+                "bus=i2c-bus.0 "
+                "-device tmp105,address=0x53,test-nack-after=1,"
+                "bus=i2c-bus.0 "
                 "-device tmp105,address=0x50,bus=i2c-bus.1 "
                 "-device tmp105,address=0x50,bus=i2c-bus.2");
     ret = g_test_run();
