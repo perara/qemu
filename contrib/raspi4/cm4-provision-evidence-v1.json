@@ -1,0 +1,85 @@
+{
+  "$comment": "/* SPDX-License-Identifier: GPL-2.0-or-later */",
+  "schema": "qemu-rpi-cm4-provision-evidence-v1",
+  "captured_at": "2026-07-28T23:02:58+02:00",
+  "scope": "privileged-inprocess-dwc2-rpiboot-exact-boot-img-handoff-acm-msd-imager-and-post-flash-handoff",
+  "status": "complete",
+  "manifest_sha256": "d1b3ed3bc080147f8b55724d01aba796d1e7e513e71a103de7e90cd23a37a9ca",
+  "supervisor_report_sha256": "ad1bcc8e99421e658ae8c214585b842b1acc3594c01a3ea7128cd39c8c164a25",
+  "supervisor_report_path": "evidence/cm4-full-image-2g-report-v1.json",
+  "rpiboot_mode": "inprocess",
+  "mass_storage_mode": "raw-bot",
+  "artifacts": {
+    "eeprom": "f1da1bda48c8f19d6eccd94f160a2c8da48fd0acdbfa47f0ac58353208d188c3",
+    "bootsys": "a7f55570459356b214ad1e08b7d11b4c8008bb5200cb24da4195d7c21cb8f819",
+    "bootsys_key_index": 1,
+    "bootsys_dependencies": "e68aa5392168fecf438527240d5e40b007cca648cc96097219f35f04cd9712f9",
+    "bootsys_dependency_count": 13,
+    "rpiboot": "f7af1fd4977707ebaf393ca88390f9903a371e50f689bf2244b875310d0a6f06",
+    "bootcode4.bin": "796487521d9834111bf089bf24528c77d6c6f89a49ab9e89c514d70f16cce694",
+    "config.txt": "f74a9db07cd32f418e25754134840b138486e39cda2a4e536042b86c5c67b687",
+    "boot.img": "a434c8d53c5ebb8a64ea4991a2b8e22f99516ac9669e892dad7065ea929857c0",
+    "imager": "c7c8a8085212c10cbefb2eb1dce13c44f19c9ee540cea4764be7b0cd5bb3bf65",
+    "compressed_image": "acff736ca7945e3b305f07cda4abdb870910e12634991da69783611756e381b3",
+    "emmc_payload_prefix_size": 2977955840,
+    "emmc_payload_prefix_sha256": "e235fd24fc5f039c08daba7d3abc04aecc7313f979d16d2a3fdad29dd44c33a9"
+  },
+  "events": [
+    "qemu-rpiboot-released",
+    "rpiboot-arm-handoff",
+    "rpiboot-complete",
+    "image-written-verified-flushed",
+    "post-flash-arm-handoff",
+    "post-flash-qemu-stopped"
+  ],
+  "inprocess_rpiboot": {
+    "device_owner": "raspi-cm4 modeled DWC2 and behavioral BCM2711 ROM",
+    "host_tool": "unchanged pinned rpiboot",
+    "proxy": "packet-only qemu-rpi-dwc2-raw-gadget-proxy",
+    "bootcode_size": 105984,
+    "config_size": 238,
+    "boot_img_size": 29360640,
+    "qmp_size_and_sha256_verified": true,
+    "boot_img_media": "exact received in-memory partitioned firmware media",
+    "boot_img_arm_handoff_verified": true,
+    "boot_img_host_extraction_used": false,
+    "emmc_preserved_as_separate_flash_target": true,
+    "standalone_file_server_used": false,
+    "raw_gadget_hidden_set_address_mirrored": true
+  },
+  "usb_profile": {
+    "authority": "unchanged pinned mass-storage-gadget64/boot.img configure-gadgets",
+    "vid_pid": "0a5c:0104",
+    "manufacturer": "Raspberry Pi",
+    "product": "Raspberry Pi multi-function USB device",
+    "serial": "51554d5552504934",
+    "interfaces": [
+      "mass-storage",
+      "cdc-acm-control",
+      "cdc-acm-data"
+    ],
+    "scsi_inquiry": "mmcblk0",
+    "stable_disk": "usb-mmcblk0_Raspberry_Pi_multi-function_USB_device_51554d5552504934-0:0",
+    "acm_tty_enumerated": true,
+    "acm_115200_round_trip": true,
+    "eight_reset_reenumerations_recovered": true,
+    "bot_probe_after_composite": "pass"
+  },
+  "host_fixture": {
+    "kernel": "7.1.4-1-cachyos",
+    "dummy_hcd_loaded": true,
+    "dummy_hcd_high_speed": true,
+    "dummy_hcd_instances": 1,
+    "dummy_hcd_super_speed": false,
+    "raw_gadget_loaded": true,
+    "libcomposite_loaded": true,
+    "lifecycle_terminal_state": "qemu-stopped",
+    "remaining_configfs_gadgets": 0
+  },
+  "hil_boundary": {
+    "physical_cm4_used": false,
+    "electrical_phy_timing_proven": false,
+    "analog_rf_or_silicon_root_proven": false,
+    "required_follow_up": "physical Pi 4B and CM4 differential conformance remains gated"
+  }
+}

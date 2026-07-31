@@ -1,0 +1,69 @@
+{
+  "$comment": "/* SPDX-License-Identifier: GPL-2.0-or-later */",
+  "schema": "qemu-rpi-cm4-continuous-guest-evidence-v1",
+  "captured_at": "2026-07-29T01:40:09+02:00",
+  "replayed_at": "2026-07-30",
+  "scope": "unchanged-rpiboot-continued-guest-acm-msd-imager-and-post-flash-handoff",
+  "status": "complete",
+  "manifest_sha256": "ff5a539437a2eccd4966af48747b924a932d8ae5f062fc551bff93d7e827fe65",
+  "manifest_path": "evidence/cm4-fast-manifest-v1.json",
+  "supervisor_report_sha256": "3651b8bff6585950d5170e2f50e50d6ebb0eaf84d969440611187c830c9bd49b",
+  "supervisor_report_path": "evidence/cm4-continuous-guest-1g-report-v1.json",
+  "rpiboot_mode": "inprocess",
+  "mass_storage_mode": "continued-guest",
+  "ram": "1G",
+  "emmc_size": 4294967296,
+  "guest_reset_count": 4,
+  "artifacts": {
+    "eeprom": "f1da1bda48c8f19d6eccd94f160a2c8da48fd0acdbfa47f0ac58353208d188c3",
+    "bootsys": "a7f55570459356b214ad1e08b7d11b4c8008bb5200cb24da4195d7c21cb8f819",
+    "bootsys_key_index": 1,
+    "bootsys_dependencies": "e68aa5392168fecf438527240d5e40b007cca648cc96097219f35f04cd9712f9",
+    "bootsys_dependency_count": 13,
+    "rpiboot": "f7af1fd4977707ebaf393ca88390f9903a371e50f689bf2244b875310d0a6f06",
+    "bootcode4.bin": "796487521d9834111bf089bf24528c77d6c6f89a49ab9e89c514d70f16cce694",
+    "config.txt": "f74a9db07cd32f418e25754134840b138486e39cda2a4e536042b86c5c67b687",
+    "boot.img": "a434c8d53c5ebb8a64ea4991a2b8e22f99516ac9669e892dad7065ea929857c0",
+    "imager": "c7c8a8085212c10cbefb2eb1dce13c44f19c9ee540cea4764be7b0cd5bb3bf65",
+    "flashed_payload_size": 29360640,
+    "flashed_payload_sha256": "a434c8d53c5ebb8a64ea4991a2b8e22f99516ac9669e892dad7065ea929857c0"
+  },
+  "continued_guest": {
+    "usb_id": "0a5c:0104",
+    "product": "Raspberry Pi multi-function USB device",
+    "scsi_vendor": "mmcblk0",
+    "block_target": "/dev/sdg",
+    "acm_target": "/dev/ttyACM0",
+    "same_dummy_hcd_usb_device": true,
+    "acm_preflash_bidirectional_echo": true,
+    "acm_postflash_bidirectional_echo": true,
+    "reset_count": 4,
+    "reset_verified_prefix_sha256": "24c0c7fe929f1433c01d15973a664663e9ed6f6f90e3f89425ba193ba80ff42d",
+    "standalone_mass_storage_substitution_used": false
+  },
+  "events": [
+    "rpiboot-arm-handoff",
+    "rpiboot-complete",
+    "continued-guest-mass-storage-ready",
+    "continued-guest-acm-preflash-echo",
+    "continued-guest-acm-postflash-echo",
+    "continued-guest-usb-reset-campaign-recovered",
+    "qemu-rpiboot-released",
+    "image-written-verified-flushed",
+    "post-flash-arm-handoff",
+    "post-flash-qemu-stopped"
+  ],
+  "host_fixture": {
+    "kernel": "7.1.4-1-cachyos",
+    "dummy_hcd_loaded": true,
+    "dummy_hcd_high_speed": true,
+    "raw_gadget_loaded": true,
+    "lifecycle_terminal_state": "qemu-stopped"
+  },
+  "hil_boundary": {
+    "physical_cm4_used": false,
+    "electrical_phy_timing_proven": false,
+    "analog_rf_or_silicon_root_proven": false,
+    "required_follow_up": "physical Pi 4B and CM4 differential conformance remains Pass 2"
+  }
+}

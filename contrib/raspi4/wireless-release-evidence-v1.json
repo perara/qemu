@@ -1,0 +1,66 @@
+{
+  "$comment": "/* SPDX-License-Identifier: GPL-2.0-or-later */",
+  "artifacts": {
+    "console_log": {
+      "bytes": 30547,
+      "filename": "qemu-rpi-wireless-bt-release7.log",
+      "sha256": "763b1d1fc4635929edeaba339d852d6b5eb7bf96e6fdacd5edcc74c38b252527"
+    },
+    "dtb": {
+      "bytes": 56407,
+      "filename": "bcm2711-rpi-4-b.dtb",
+      "sha256": "75761b73c284e26623e4d1624bff13e67bce2ae620880efd81d6571a3739fcfb"
+    },
+    "initramfs": {
+      "bytes": 19516914,
+      "filename": "qemu-rpi-initramfs-bt-release3.img",
+      "sha256": "f44eb0a8ed97ed649271ac8d0457a427b9776ef9e5230cc1c248970ad10d7622"
+    },
+    "kernel": {
+      "bytes": 10168774,
+      "filename": "kernel8.img",
+      "sha256": "9cf86cfbe4e8e47b3c30ee4d1dedf805354637c1e90508d880aa5cea9a69935a"
+    },
+    "module_package": {
+      "bytes": 31980088,
+      "filename": "linux-image-6.18.34-rpi-v8.deb",
+      "sha256": "687315225328ff1a4cd2be43f0582c0b6c7c20c9b8900142c5d6b20393f21b1f"
+    },
+    "qemu": {
+      "bytes": 132018160,
+      "filename": "qemu-system-aarch64",
+      "sha256": "3359c506c94cfafab4fa8d65f82b6c9ae60abfe8216b8967d5dd2bf24145f1dc"
+    }
+  },
+  "forbidden_markers": [
+    "unexpected cc",
+    "Opcode 0x",
+    "QEMU-RPI-WIFI-DIAG: brcmfmac-status=1",
+    "QEMU-RPI-WIFI-DIAG: wcc-status=1",
+    "QEMU-RPI-BT-DIAG: bluetooth-status=1",
+    "QEMU-RPI-BT-DIAG: btbcm-status=1",
+    "QEMU-RPI-BT-DIAG: hci_uart-status=1"
+  ],
+  "required_markers": [
+    "Linux version 6.18.34+rpt-rpi-v8",
+    "QEMU-RPI-WIFI-DIAG: brcmfmac-status=0",
+    "QEMU-RPI-WIFI-DIAG: wcc-status=0",
+    "post-bind=mmc1:0001:1 driver=",
+    "post-bind=mmc1:0001:2 driver=",
+    "QEMU-RPI-WIFI-DIAG: netdev=wlan0",
+    "QEMU-RPI-WIFI-DIAG: link-up-status=0",
+    "QEMU-RPI-WIFI-DIAG: dhcp-status=0",
+    "QEMU-RPI-WIFI-DIAG: ping-status=0",
+    "QEMU-RPI-BT-DIAG: bluetooth-status=0",
+    "QEMU-RPI-BT-DIAG: btbcm-status=0",
+    "QEMU-RPI-BT-DIAG: hci_uart-status=0",
+    "QEMU-RPI-BT-DIAG: hci0-present=0",
+    "Bluetooth: HCI UART protocol Broadcom registered",
+    "Bluetooth: hci0: BCM: chip id 74",
+    "Bluetooth: hci0: BCM: features 0x01",
+    "Bluetooth: hci0: QEMU CYW43455 Bluetooth",
+    "Bluetooth: hci0: BCM4345C0 (003.001.025) build 0001"
+  ],
+  "result": "pass",
+  "schema": "qemu-rpi-wireless-release-evidence-v1"
+}

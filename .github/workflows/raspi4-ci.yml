@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Raspberry Pi platform CI
+
+on:
+  push:
+    branches:
+      - raspi4/**
+  pull_request:
+    branches:
+      - raspi4/full-platform
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: raspi4-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RASPI4_BASELINE: 0345ef676befc1a180d2f63bceaf3fca1d07ee88
+
+jobs:
+  source-integrity:
+    name: Source, evidence, and publication integrity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          fetch-depth: 128
+          persist-credentials: false
+
+      - name: Validate source formatting
+        run: git diff --check "$RASPI4_BASELINE..HEAD"
+
+      - name: Validate commit series
+        run: |
+          git diff --binary "$RASPI4_BASELINE..HEAD" -- \
+            '*.c' '*.h' '*.py' '*.sh' |
+            ./scripts/checkpatch.pl --no-tree --no-signoff -
+
+      - name: Run host-tool tests
+        run: |
+          python3 -m unittest discover -v \
+            -s contrib/raspi4 -p 'test_*.py'
+
+      - name: Validate implementation matrix
+        run: |
+          python3 contrib/raspi4/matrix_progress.py --check
+          python3 contrib/raspi4/matrix_progress.py --check-dashboard
+
+      - name: Audit publication contents
+        run: |
+          python3 contrib/raspi4/publication_audit.py \
+            --baseline "$RASPI4_BASELINE"
+
+  build-and-test:
+    name: AArch64 build and Raspberry Pi qtests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libaio-dev libattr1-dev libcap-ng-dev libfdt-dev \
+            libglib2.0-dev libgnutls28-dev libpixman-1-dev \
+            libslirp-dev libssh-dev liburing-dev libusb-1.0-0-dev \
+            meson ninja-build pkg-config python3 python3-venv zlib1g-dev
+
+      - name: Configure
+        run: |
+          ./configure \
+            --target-list=aarch64-softmmu \
+            --disable-docs \
+            --disable-werror
+
+      - name: Build platform and host tools
+        run: |
+          ninja -C build \
+            qemu-system-aarch64 \
+            tests/qtest/raspi4-boot-test \
+            qemu-rpi-qgpio-core-test \
+            qemu-rpi-rpiboot-raw-gadget \
+            qemu-rpi-dwc2-raw-gadget-proxy \
+            qemu-rpi-cm4-msd
+
+      - name: Run compiled host-tool self-tests
+        # configure bootstraps its own meson into build/pyvenv, which is
+        # newer than the distribution one; running the build directory with
+        # the distribution meson fails to read build.dat.
+        run: |
+          ./build/pyvenv/bin/meson test -C build --print-errorlogs \
+            qemu-rpi-qgpio-core-self-test \
+            qemu-rpi-rpiboot-self-test \
+            qemu-rpi-dwc2-proxy-self-test \
+            qemu-rpi-cm4-msd-self-test
+
+      - name: Run Raspberry Pi qtests
+        env:
+          QTEST_QEMU_BINARY: ./build/qemu-system-aarch64
+        run: ./build/tests/qtest/raspi4-boot-test
+
+      - name: Account for functional gates
+        env:
+          QEMU_TEST_QEMU_BINARY: ${{ github.workspace }}/build/qemu-system-aarch64
+        run: |
+          ./build/run tests/functional/aarch64/test_raspi4.py
+
+  toolchain-matrix:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # A second compiler: clang's flow analysis reports uninitialised
+          # uses that gcc does not, but only when warnings are fatal.
+          - name: clang, warnings fatal
+            extra_packages: clang
+            configure_args: --cc=clang --cxx=clang++
+          # The minimum feature set: pixman and friends are absent, so any
+          # unguarded use of an optional library shows up as a build failure.
+          - name: gcc, no default features
+            extra_packages: gcc
+            configure_args: --without-default-features
+    steps:
+      - name: Check out source
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            ${{ matrix.extra_packages }} \
+            libaio-dev libattr1-dev libcap-ng-dev libfdt-dev \
+            libglib2.0-dev libgnutls28-dev libpixman-1-dev \
+            libslirp-dev libssh-dev liburing-dev libusb-1.0-0-dev \
+            meson ninja-build pkg-config python3 python3-venv zlib1g-dev
+
+      - name: Configure
+        run: |
+          ./configure \
+            --target-list=aarch64-softmmu \
+            --disable-docs \
+            --enable-werror \
+            ${{ matrix.configure_args }}
+
+      - name: Build
+        run: ninja -C build

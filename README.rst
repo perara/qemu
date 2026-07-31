@@ -2,6 +2,31 @@
 QEMU README
 ===========
 
+Raspberry Pi 4B and CM4 platform fork
+======================================
+
+This branch adds a behaviorally faithful Raspberry Pi 4 Model B and Compute
+Module 4 platform, including unchanged-image flashing, EEPROM ``BOOT_ORDER``,
+SD/eMMC/USB/NVMe/network boot, CM4 ``rpiboot``, peripheral models, deterministic
+fault injection, and host/HIL bridge tooling.
+
+The supported product branch is ``raspi4/full-platform``.  Its automated
+Pass 1 software-visible campaign is complete.  Electrical, analogue, PHY, RF,
+cycle-accurate, and silicon-security conformance remain explicit Pass 2
+hardware-in-the-loop gates and are not claimed by software tests.
+
+Start here:
+
+* `Platform overview <docs/devel/raspi4-platform.rst>`_
+* `Usage and validation <contrib/raspi4/README.rst>`_
+* `Implementation matrix <RASPI4_IMPLEMENTATION_MATRIX.md>`_
+* `Release policy <RASPI4_RELEASE.md>`_
+* `Fork contribution guide <CONTRIBUTING_RASPI4.md>`_
+* `Security policy <SECURITY.md>`_
+
+This is an independent QEMU fork.  It is not an official Raspberry Pi product
+and is not endorsed by Raspberry Pi Ltd.
+
 QEMU is a generic and open source machine & userspace emulator and
 virtualizer.
 

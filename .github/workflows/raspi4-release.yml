@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Raspberry Pi platform release
+
+on:
+  push:
+    tags:
+      - rpi4-v*
+
+permissions:
+  actions: read
+  attestations: write
+  contents: write
+  id-token: write
+
+env:
+  RASPI4_BASELINE: 0345ef676befc1a180d2f63bceaf3fca1d07ee88
+
+jobs:
+  release:
+    name: Build, attest, and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          fetch-depth: 128
+          persist-credentials: false
+
+      - name: Validate tag and source
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^rpi4-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          git fetch --no-tags origin \
+            raspi4/full-platform:refs/remotes/origin/raspi4/full-platform
+          test "$GITHUB_SHA" = \
+            "$(git rev-parse refs/remotes/origin/raspi4/full-platform)"
+          python3 contrib/raspi4/publication_audit.py \
+            --baseline "$RASPI4_BASELINE"
+          python3 contrib/raspi4/matrix_progress.py --check
+          python3 contrib/raspi4/matrix_progress.py --check-dashboard
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libaio-dev libattr1-dev libcap-ng-dev libfdt-dev \
+            libglib2.0-dev libgnutls28-dev libpixman-1-dev \
+            libslirp-dev libssh-dev liburing-dev libusb-1.0-0-dev \
+            meson ninja-build pkg-config python3 python3-venv xz-utils \
+            zlib1g-dev
+
+      - name: Configure and build
+        run: |
+          ./configure \
+            --target-list=aarch64-softmmu \
+            --disable-docs \
+            --disable-werror
+          ninja -C build \
+            qemu-system-aarch64 \
+            qemu-img \
+            qemu-rpi-qgpio-core-test \
+            qemu-rpi-rpiboot-raw-gadget \
+            qemu-rpi-dwc2-raw-gadget-proxy \
+            qemu-rpi-cm4-msd
+
+      - name: Run release tests
+        run: |
+          python3 -m unittest discover -v \
+            -s contrib/raspi4 -p 'test_*.py'
+          meson test -C build --print-errorlogs \
+            qemu-rpi-qgpio-core-self-test \
+            qemu-rpi-rpiboot-self-test \
+            qemu-rpi-dwc2-proxy-self-test \
+            qemu-rpi-cm4-msd-self-test
+
+      - name: Stage deterministic release tree
+        run: |
+          package="qemu-rpi4-${GITHUB_REF_NAME}-linux-x86_64"
+          root="release-root/${package}"
+          install -Dm755 build/qemu-system-aarch64 \
+            "${root}/bin/qemu-system-aarch64"
+          install -Dm755 build/qemu-img "${root}/bin/qemu-img"
+          install -Dm755 build/qemu-rpi-rpiboot-raw-gadget \
+            "${root}/bin/qemu-rpi-rpiboot-raw-gadget"
+          install -Dm755 build/qemu-rpi-dwc2-raw-gadget-proxy \
+            "${root}/bin/qemu-rpi-dwc2-raw-gadget-proxy"
+          install -Dm755 build/qemu-rpi-cm4-msd \
+            "${root}/bin/qemu-rpi-cm4-msd"
+          install -Dm644 LICENSE "${root}/share/licenses/qemu/LICENSE"
+          install -Dm644 COPYING "${root}/share/licenses/qemu/COPYING"
+          install -Dm644 COPYING.LIB "${root}/share/licenses/qemu/COPYING.LIB"
+          install -Dm644 RASPI4_IMPLEMENTATION_MATRIX.md \
+            "${root}/share/doc/RASPI4_IMPLEMENTATION_MATRIX.md"
+          install -Dm644 RASPI4_RELEASE.md \
+            "${root}/share/doc/RASPI4_RELEASE.md"
+          install -Dm644 contrib/raspi4/README.rst \
+            "${root}/share/doc/README.rst"
+          mkdir -p "${root}/share/qemu-rpi4"
+          cp -a contrib/raspi4/*.py contrib/raspi4/*.json \
+            "${root}/share/qemu-rpi4/"
+          mkdir -p dist
+          epoch="$(git show -s --format=%ct HEAD)"
+          tar --sort=name --mtime="@${epoch}" --owner=0 --group=0 \
+            --numeric-owner -C release-root -cJf "dist/${package}.tar.xz" \
+            "${package}"
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@8e94d75ddd33f69f691467e42275782e4bfefe84
+        with:
+          path: release-root
+          format: spdx-json
+          output-file: dist/qemu-rpi4.spdx.json
+          artifact-name: qemu-rpi4.spdx.json
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate and verify checksums and manifest
+        run: |
+          cd dist
+          sha256sum qemu-rpi4-*.tar.xz qemu-rpi4.spdx.json > SHA256SUMS
+          cd ..
+          archive="$(find dist -maxdepth 1 -name 'qemu-rpi4-*.tar.xz' -print -quit)"
+          python3 contrib/raspi4/release_manifest.py create \
+            --release "$GITHUB_REF_NAME" \
+            --source-commit "$GITHUB_SHA" \
+            --upstream-baseline "$RASPI4_BASELINE" \
+            --artifact "binary=${archive}" \
+            --artifact "sbom=dist/qemu-rpi4.spdx.json" \
+            --artifact "checksums=dist/SHA256SUMS" \
+            --pass1 complete \
+            --hil-ready 0 \
+            --hil-total 12 \
+            --output dist/raspi4-release-manifest-v1.json
+          (cd dist && sha256sum --check SHA256SUMS)
+          python3 contrib/raspi4/release_manifest.py verify \
+            --manifest dist/raspi4-release-manifest-v1.json \
+            --artifact-dir dist
+
+      - name: Attest release archive
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: dist/qemu-rpi4-*.tar.xz
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            test "$(gh release view "$GITHUB_REF_NAME" \
+              --json isDraft --jq .isDraft)" = true
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --draft \
+              --title "Raspberry Pi 4B/CM4 ${GITHUB_REF_NAME}" \
+              --notes-file RASPI4_RELEASE_NOTES.md \
+              --verify-tag
+          fi
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest

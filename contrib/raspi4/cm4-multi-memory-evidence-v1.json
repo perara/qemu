@@ -1,0 +1,96 @@
+{
+  "$comment": "/* SPDX-License-Identifier: GPL-2.0-or-later */",
+  "schema": "qemu-rpi-cm4-multi-memory-evidence-v1",
+  "captured_at": "2026-07-29T01:51:02+02:00",
+  "replayed_at": "2026-07-30",
+  "scope": "same-artifact-unchanged-rpiboot-continued-guest-imager-post-flash-handoff-across-all-cm4-memory-models",
+  "status": "complete",
+  "manifest_sha256": "ff5a539437a2eccd4966af48747b924a932d8ae5f062fc551bff93d7e827fe65",
+  "manifest_path": "evidence/cm4-fast-manifest-v1.json",
+  "artifact_set_sha256": "c51d7cb1432eb754403a58155b120acb558d5d98248eec0f9d76d8083b609d4e",
+  "rpiboot_mode": "inprocess",
+  "mass_storage_mode": "continued-guest",
+  "emmc_size": 4294967296,
+  "models": [
+    {
+      "ram": "1G",
+      "captured_at": "2026-07-29T01:28:08+02:00",
+      "supervisor_report_sha256": "6ad5359b62aafae85473d62d1f69492615672a2ee510c3bb8d0df0360deea33f",
+      "supervisor_report_path": "evidence/cm4-memory-1g-report-v1.json",
+      "status": "complete",
+      "rpiboot_arm_handoff": true,
+      "matching_acm_msd": true,
+      "imager_write_verify_flush": true,
+      "post_flash_arm_handoff": true
+    },
+    {
+      "ram": "2G",
+      "captured_at": "2026-07-29T01:42:21+02:00",
+      "supervisor_report_sha256": "be578e86545b77b537addbefbe5442f3e843f140bfb4047018b1f8d8799b4ef0",
+      "supervisor_report_path": "evidence/cm4-memory-2g-report-v1.json",
+      "status": "complete",
+      "rpiboot_arm_handoff": true,
+      "matching_acm_msd": true,
+      "imager_write_verify_flush": true,
+      "post_flash_arm_handoff": true
+    },
+    {
+      "ram": "4G",
+      "captured_at": "2026-07-29T01:43:20+02:00",
+      "supervisor_report_sha256": "d1fab8bbf6b3e221768d24229bd48f83d96bf3679b9d93f703d4092f7ef513d0",
+      "supervisor_report_path": "evidence/cm4-memory-4g-report-v1.json",
+      "status": "complete",
+      "rpiboot_arm_handoff": true,
+      "matching_acm_msd": true,
+      "imager_write_verify_flush": true,
+      "post_flash_arm_handoff": true
+    },
+    {
+      "ram": "8G",
+      "captured_at": "2026-07-29T01:51:02+02:00",
+      "supervisor_report_sha256": "d616a914cd0b0d2930fc71408bdfcb03a8fb66dc643fc116ff7048bfe051612a",
+      "supervisor_report_path": "evidence/cm4-memory-8g-report-v1.json",
+      "status": "complete",
+      "rpiboot_arm_handoff": true,
+      "matching_acm_msd": true,
+      "imager_write_verify_flush": true,
+      "post_flash_arm_handoff": true
+    }
+  ],
+  "shared_artifacts": {
+    "eeprom": "f1da1bda48c8f19d6eccd94f160a2c8da48fd0acdbfa47f0ac58353208d188c3",
+    "bootsys": "a7f55570459356b214ad1e08b7d11b4c8008bb5200cb24da4195d7c21cb8f819",
+    "bootsys_dependencies": "e68aa5392168fecf438527240d5e40b007cca648cc96097219f35f04cd9712f9",
+    "rpiboot": "f7af1fd4977707ebaf393ca88390f9903a371e50f689bf2244b875310d0a6f06",
+    "bootcode4.bin": "796487521d9834111bf089bf24528c77d6c6f89a49ab9e89c514d70f16cce694",
+    "config.txt": "f74a9db07cd32f418e25754134840b138486e39cda2a4e536042b86c5c67b687",
+    "boot.img": "a434c8d53c5ebb8a64ea4991a2b8e22f99516ac9669e892dad7065ea929857c0",
+    "imager": "c7c8a8085212c10cbefb2eb1dce13c44f19c9ee540cea4764be7b0cd5bb3bf65",
+    "flashed_payload": "a434c8d53c5ebb8a64ea4991a2b8e22f99516ac9669e892dad7065ea929857c0"
+  },
+  "memory_layout": {
+    "low_peripheral_hole_start": "0xfc000000",
+    "high_dram_start": "0x100000000",
+    "production_dtb_size_cells": 1,
+    "eight_gib_high_banks": [
+      {
+        "base": "0x100000000",
+        "size": "0x80000000"
+      },
+      {
+        "base": "0x180000000",
+        "size": "0x80000000"
+      },
+      {
+        "base": "0x200000000",
+        "size": "0x04000000"
+      }
+    ]
+  },
+  "hil_boundary": {
+    "physical_cm4_used": false,
+    "pass_1_accounting": "HIL-pending capabilities count as complete",
+    "pass_2_hil_readiness": "0/12",
+    "required_follow_up": "physical Pi 4B and CM4 differential conformance remains Pass 2"
+  }
+}

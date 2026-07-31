@@ -1,0 +1,37 @@
+{
+  "schema": "qemu-rpi-cm4-provision-v1",
+  "artifacts": {
+    "eeprom": {
+      "sha256": "f1da1bda48c8f19d6eccd94f160a2c8da48fd0acdbfa47f0ac58353208d188c3",
+      "size": 524288,
+      "bootsys_sha256": "a7f55570459356b214ad1e08b7d11b4c8008bb5200cb24da4195d7c21cb8f819",
+      "bootsys_key_index": 1,
+      "dependencies_sha256": "e68aa5392168fecf438527240d5e40b007cca648cc96097219f35f04cd9712f9"
+    },
+    "rpiboot": {
+      "sha256": "f7af1fd4977707ebaf393ca88390f9903a371e50f689bf2244b875310d0a6f06",
+      "size": 756536
+    },
+    "bootcode4.bin": {
+      "sha256": "796487521d9834111bf089bf24528c77d6c6f89a49ab9e89c514d70f16cce694",
+      "size": 105984
+    },
+    "config.txt": {
+      "sha256": "f74a9db07cd32f418e25754134840b138486e39cda2a4e536042b86c5c67b687",
+      "size": 238
+    },
+    "boot.img": {
+      "sha256": "a434c8d53c5ebb8a64ea4991a2b8e22f99516ac9669e892dad7065ea929857c0",
+      "size": 29360640
+    },
+    "imager": {
+      "sha256": "c7c8a8085212c10cbefb2eb1dce13c44f19c9ee540cea4764be7b0cd5bb3bf65",
+      "size": 21703160
+    },
+    "image": {
+      "sha256": "a434c8d53c5ebb8a64ea4991a2b8e22f99516ac9669e892dad7065ea929857c0",
+      "size": 29360640,
+      "payload_sha256": "a434c8d53c5ebb8a64ea4991a2b8e22f99516ac9669e892dad7065ea929857c0"
+    }
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "$comment": "/* SPDX-License-Identifier: GPL-2.0-or-later */",
+  "artifacts": {
+    "boot.img": "a434c8d53c5ebb8a64ea4991a2b8e22f99516ac9669e892dad7065ea929857c0",
+    "bootcode4.bin": "796487521d9834111bf089bf24528c77d6c6f89a49ab9e89c514d70f16cce694",
+    "bootsys": "a7f55570459356b214ad1e08b7d11b4c8008bb5200cb24da4195d7c21cb8f819",
+    "bootsys-dependencies": "e68aa5392168fecf438527240d5e40b007cca648cc96097219f35f04cd9712f9",
+    "bootsys-dependency-count": "13",
+    "bootsys-key-index": "1",
+    "config.txt": "f74a9db07cd32f418e25754134840b138486e39cda2a4e536042b86c5c67b687",
+    "eeprom": "f1da1bda48c8f19d6eccd94f160a2c8da48fd0acdbfa47f0ac58353208d188c3",
+    "image": "a434c8d53c5ebb8a64ea4991a2b8e22f99516ac9669e892dad7065ea929857c0",
+    "imager": "c7c8a8085212c10cbefb2eb1dce13c44f19c9ee540cea4764be7b0cd5bb3bf65",
+    "rpiboot": "f7af1fd4977707ebaf393ca88390f9903a371e50f689bf2244b875310d0a6f06"
+  },
+  "continued_guest": {
+    "acm_target": "/dev/ttyACM0",
+    "block_target": "/dev/sdg",
+    "product": "Raspberry Pi multi-function USB device",
+    "scsi_vendor": "mmcblk0",
+    "usb_id": "0a5c:0104"
+  },
+  "emmc_size": 4294967296,
+  "events": [
+    "rpiboot-arm-handoff",
+    "rpiboot-complete",
+    "continued-guest-mass-storage-ready",
+    "continued-guest-acm-preflash-echo",
+    "continued-guest-acm-postflash-echo",
+    "qemu-rpiboot-released",
+    "image-written-verified-flushed",
+    "post-flash-arm-handoff",
+    "post-flash-qemu-stopped"
+  ],
+  "guest_reset_count": 0,
+  "mass_storage_mode": "continued-guest",
+  "ram": "1G",
+  "rpiboot_mode": "inprocess",
+  "schema": "qemu-rpi-cm4-provision-v1",
+  "status": "complete"
+}

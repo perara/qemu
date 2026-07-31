@@ -1771,6 +1771,10 @@ Run the self-contained tests with::
   python3 -m unittest discover -v \
       -s contrib/raspi4 -p 'test_*.py'
 
+Recompute the implementation matrix and fail if its headline is stale with::
+
+  python3 contrib/raspi4/matrix_progress.py --check-dashboard
+
 After configuring QEMU, run the behavioral boundary qtests with::
 
   ninja -C build qemu-system-aarch64 tests/qtest/raspi4-boot-test

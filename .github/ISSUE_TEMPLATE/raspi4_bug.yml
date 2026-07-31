@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Raspberry Pi platform bug
+description: Report a reproducible Pi 4B or CM4 emulation defect
+title: "raspi4: "
+labels:
+  - raspi4
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities or include credentials, private
+        keys, restricted firmware, or sensitive hardware captures here.
+  - type: input
+    id: version
+    attributes:
+      label: Commit or release
+      placeholder: rpi4-v0.1.0 or full commit hash
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Raspberry Pi 4B
+        - Compute Module 4
+        - Host or HIL tooling
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command and configuration
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and sanitized logs
+    validations:
+      required: true
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Artifact identities
+      description: Provide versions and SHA-256 values, not restricted bytes.
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmation
+      options:
+        - label: I removed credentials, private keys, and unique device secrets.
+          required: true
+        - label: I identified whether this is software evidence or physical HIL evidence.
+          required: true

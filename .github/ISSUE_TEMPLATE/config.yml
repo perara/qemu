@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/perara/qemu/security/advisories/new
+    about: Report fork-specific vulnerabilities privately.
+  - name: Upstream QEMU issues
+    url: https://gitlab.com/qemu-project/qemu/-/issues
+    about: Report defects reproducible in unmodified upstream QEMU.
