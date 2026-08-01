@@ -200,7 +200,17 @@ struct SDState {
         uint32_t write_counter;
         uint8_t key[RPMB_KEY_MAC_LEN];
         uint8_t key_set;
-        RPMBDataFrame result;
+        /*
+         * RPMBDataFrame is packed to match the wire format, so it would
+         * otherwise be placed straight after key_set, at an odd offset.
+         * vmstate takes the address of write_counter and address inside
+         * it, and the migration helpers dereference those as aligned
+         * types; on a host that requires alignment that is a fault
+         * rather than a slow access.  Only the placement of the frame
+         * changes, not its layout or size, so neither the RPMB wire
+         * format nor the migration stream is affected.
+         */
+        QEMU_ALIGNED(4) RPMBDataFrame result;
     } rpmb;
     QEMUTimer *ocr_power_timer;
     uint8_t dat_lines;
